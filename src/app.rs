@@ -366,9 +366,30 @@ impl PhaseVisualizerApp {
             .response
             .on_hover_text("Draw the charges at the inner corners");
 
-            ui.add_space(4.0);
-            ui.weak("solid wall = cut edge");
-            ui.weak("dashed wall = integration path");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.overlay_options.show_tree_edges, "");
+                swatch(ui, TREE_WALL_SWATCH, "integration path (dashed)");
+            })
+            .response
+            .on_hover_text(
+                "Draw the walls the integration walks through. Off, only the cut \
+                 edges remain — the spanning tree of the dual graph on its own.",
+            );
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.overlay_options.green_cut_edges, "");
+                let color = if self.overlay_options.green_cut_edges {
+                    CUT_WALL_GREEN_SWATCH
+                } else {
+                    CUT_WALL_SWATCH
+                };
+                swatch(ui, color, "green cut edges (solid)");
+            })
+            .response
+            .on_hover_text(
+                "Pick the cut edges out in green. The image border stays neutral: \
+                 it bounds the outer face O and is not an edge of G.",
+            );
         }
     }
 
@@ -477,6 +498,9 @@ impl PhaseVisualizerApp {
 const HIGHLIGHT_SWATCH: egui::Color32 = egui::Color32::from_rgb(232, 23, 135);
 const RESIDUE_POSITIVE_SWATCH: egui::Color32 = egui::Color32::from_rgb(245, 130, 31);
 const RESIDUE_NEGATIVE_SWATCH: egui::Color32 = egui::Color32::from_rgb(92, 199, 232);
+const CUT_WALL_SWATCH: egui::Color32 = egui::Color32::from_rgb(10, 10, 13);
+const CUT_WALL_GREEN_SWATCH: egui::Color32 = egui::Color32::from_rgb(33, 176, 77);
+const TREE_WALL_SWATCH: egui::Color32 = egui::Color32::from_rgb(120, 120, 128);
 
 /// A colour chip with a caption, for the overlay legend.
 fn swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {

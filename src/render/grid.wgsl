@@ -23,6 +23,9 @@ struct Uniforms {
     // x = overlay enabled, y = residue radius in pixels,
     // z = highlight disagreeing edges, w = draw residues.
     overlay: vec4<f32>,
+
+    // x = green cut edges, y = draw the integration path's walls, zw = unused.
+    overlay_flags: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -44,6 +47,10 @@ const TRAVERSAL_ABSENT: u32 = 3u;
 // Cell walls are drawn dark. `Colormap::Grayscale` keeps a non-zero floor so
 // that they stay visible even where the data bottoms out.
 const WALL_COLOR = vec3<f32>(0.04, 0.04, 0.05);
+
+// Optional colour for the cut edges, which together form the spanning tree of
+// the dual graph.
+const CUT_WALL_GREEN = vec3<f32>(0.13, 0.69, 0.30);
 
 // Edges where the integration delta is not the wrapped delta.
 const HIGHLIGHT_COLOR = vec3<f32>(0.91, 0.09, 0.53);
@@ -153,10 +160,20 @@ fn wall_along_axis(
             // wrapped difference across this edge.
             out.color = HIGHLIGHT_COLOR;
             half_px = base_half_px * HIGHLIGHT_WIDTH_SCALE;
-        } else if traversal != TRAVERSAL_CUT && traversal != TRAVERSAL_ABSENT {
+        } else if traversal == TRAVERSAL_CUT {
+            // A wall the integration never crosses. These are the spanning
+            // tree of the dual graph, and can be picked out in green.
+            if u.overlay_flags.x > 0.5 {
+                out.color = CUT_WALL_GREEN;
+            }
+        } else if traversal != TRAVERSAL_ABSENT {
             // Part of the integration path: drawn faint and dashed, since the
-            // walk passes straight through it.
-            alpha = TREE_WALL_ALPHA * step(0.5, fract(along / DASH_PERIOD));
+            // walk passes straight through it, or left out altogether.
+            if u.overlay_flags.y > 0.5 {
+                alpha = TREE_WALL_ALPHA * step(0.5, fract(along / DASH_PERIOD));
+            } else {
+                alpha = 0.0;
+            }
         }
     }
 

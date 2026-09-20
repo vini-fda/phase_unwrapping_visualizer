@@ -85,6 +85,20 @@ pub struct OverlayOptions {
 
     /// Draw the residue charges at the inner corners.
     pub show_residues: bool,
+
+    /// Draw the cut edges — the spanning tree of the dual — in green instead
+    /// of the default near-black.
+    ///
+    /// The image border is left neutral either way: it bounds the outer face
+    /// `O` and is not an edge of `G`, so colouring it would blur the very
+    /// structure the green is there to pick out.
+    pub green_cut_edges: bool,
+
+    /// Draw the walls the integration path crosses at all.
+    ///
+    /// With these off only the cut edges remain, which is the dual spanning
+    /// tree on its own.
+    pub show_tree_edges: bool,
 }
 
 impl Default for OverlayOptions {
@@ -92,6 +106,8 @@ impl Default for OverlayOptions {
         Self {
             highlight_edges: true,
             show_residues: true,
+            green_cut_edges: false,
+            show_tree_edges: true,
         }
     }
 }
@@ -129,11 +145,15 @@ pub struct GridUniforms {
     pub highlight_edges: f32,
     /// `1.0` to draw the residue markers.
     pub show_residues: f32,
+    /// `1.0` to draw the cut edges in green.
+    pub green_cut_edges: f32,
+    /// `1.0` to draw the walls the integration path crosses.
+    pub show_tree_edges: f32,
 }
 
 impl GridUniforms {
-    /// Size of the encoded block, in bytes: four `vec4<f32>`.
-    pub const SIZE: usize = 64;
+    /// Size of the encoded block, in bytes: five `vec4<f32>`.
+    pub const SIZE: usize = 80;
 
     /// Builds the uniforms for one frame.
     ///
@@ -173,6 +193,8 @@ impl GridUniforms {
             residue_radius_px: residue_radius(pixels_per_cell),
             highlight_edges: flag(overlay.is_some_and(|overlay| overlay.highlight_edges)),
             show_residues: flag(overlay.is_some_and(|overlay| overlay.show_residues)),
+            green_cut_edges: flag(overlay.is_some_and(|overlay| overlay.green_cut_edges)),
+            show_tree_edges: flag(overlay.is_some_and(|overlay| overlay.show_tree_edges)),
         }
     }
 
@@ -181,7 +203,7 @@ impl GridUniforms {
     /// Done by hand rather than by transmuting a `#[repr(C)]` struct: the crate
     /// forbids `unsafe`, and this keeps the layout explicit and testable.
     fn to_bytes(self) -> [u8; Self::SIZE] {
-        let floats: [f32; 16] = [
+        let floats: [f32; 20] = [
             // bounds
             self.data_min[0],
             self.data_min[1],
@@ -202,6 +224,11 @@ impl GridUniforms {
             self.residue_radius_px,
             self.highlight_edges,
             self.show_residues,
+            // overlay_flags
+            self.green_cut_edges,
+            self.show_tree_edges,
+            0.0,
+            0.0,
         ];
 
         let mut bytes = [0u8; Self::SIZE];
@@ -957,9 +984,9 @@ mod tests {
     /// The byte layout is the contract with `grid.wgsl`; if it drifts, the image
     /// silently renders garbage rather than failing to compile.
     #[test]
-    fn uniforms_encode_four_vec4s_in_shader_order() {
+    fn uniforms_encode_five_vec4s_in_shader_order() {
         let bytes = uniforms().to_bytes();
-        assert_eq!(bytes.len(), 64, "four vec4<f32> is 64 bytes");
+        assert_eq!(bytes.len(), 80, "five vec4<f32> is 80 bytes");
 
         let decoded: Vec<f32> = bytes
             .chunks_exact(4)
@@ -991,6 +1018,11 @@ mod tests {
                 // overlay: disabled, residue radius, then the two toggles
                 0.0,
                 residue_radius(12.0),
+                0.0,
+                0.0, //
+                // overlay_flags: green cut edges, integration path, two spare
+                0.0,
+                0.0,
                 0.0,
                 0.0,
             ],
@@ -1037,40 +1069,53 @@ mod tests {
         );
     }
 
-    /// Each checkbox has to reach the shader on its own: the two were once a
-    /// single "overlay on" flag, and nothing else tells them apart.
+    /// Each checkbox has to reach the shader on its own: they were once a
+    /// single "overlay on" flag, and nothing else tells them apart. Every
+    /// combination is walked, so a pair swapped in the encoding cannot hide.
     #[test]
     fn each_overlay_toggle_reaches_the_shader_independently() {
-        for (highlight_edges, show_residues) in
-            [(true, true), (true, false), (false, true), (false, false)]
-        {
-            let uniforms = GridUniforms::new(
-                Rect::ZERO,
-                4,
-                4,
-                10.0,
-                (0.0, 1.0),
-                false,
-                Some(OverlayOptions {
-                    highlight_edges,
-                    show_residues,
-                }),
-            );
+        for bits in 0u8..16 {
+            let options = OverlayOptions {
+                highlight_edges: bits & 1 != 0,
+                show_residues: bits & 2 != 0,
+                green_cut_edges: bits & 4 != 0,
+                show_tree_edges: bits & 8 != 0,
+            };
+            let uniforms =
+                GridUniforms::new(Rect::ZERO, 4, 4, 10.0, (0.0, 1.0), false, Some(options));
 
             assert_eq!(
                 uniforms.overlay_enabled, 1.0,
                 "the overlay itself is still on whatever the toggles say"
             );
-            assert_eq!(
-                uniforms.highlight_edges,
-                flag(highlight_edges),
-                "highlight_edges = {highlight_edges} must survive to the shader"
-            );
-            assert_eq!(
-                uniforms.show_residues,
-                flag(show_residues),
-                "show_residues = {show_residues} must survive to the shader"
-            );
+            for (name, got, want) in [
+                (
+                    "highlight_edges",
+                    uniforms.highlight_edges,
+                    options.highlight_edges,
+                ),
+                (
+                    "show_residues",
+                    uniforms.show_residues,
+                    options.show_residues,
+                ),
+                (
+                    "green_cut_edges",
+                    uniforms.green_cut_edges,
+                    options.green_cut_edges,
+                ),
+                (
+                    "show_tree_edges",
+                    uniforms.show_tree_edges,
+                    options.show_tree_edges,
+                ),
+            ] {
+                assert_eq!(
+                    got,
+                    flag(want),
+                    "{name} = {want} must survive to the shader"
+                );
+            }
         }
     }
 
@@ -1082,13 +1127,23 @@ mod tests {
         assert_eq!(uniforms.overlay_enabled, 0.0, "no overlay");
         assert_eq!(uniforms.highlight_edges, 0.0, "and so no highlighting");
         assert_eq!(uniforms.show_residues, 0.0, "and no residues");
+        assert_eq!(uniforms.green_cut_edges, 0.0, "and nothing to colour green");
+        assert_eq!(uniforms.show_tree_edges, 0.0, "and no integration path");
     }
 
     #[test]
-    fn both_overlays_are_on_by_default() {
+    fn the_overlay_defaults_show_everything_in_the_original_colours() {
         let options = OverlayOptions::default();
         assert!(options.highlight_edges, "highlighting starts enabled");
         assert!(options.show_residues, "residues start enabled");
+        assert!(
+            options.show_tree_edges,
+            "the integration path starts visible"
+        );
+        assert!(
+            !options.green_cut_edges,
+            "cut edges keep their original colour until asked otherwise"
+        );
     }
 
     #[test]
