@@ -20,7 +20,8 @@ struct Uniforms {
     // x = value at t = 0, y = 1 / (value range), z = wrap mode, w = wall opacity.
     shading: vec4<f32>,
 
-    // x = overlay enabled, y = residue radius in pixels, zw = unused.
+    // x = overlay enabled, y = residue radius in pixels,
+    // z = highlight disagreeing edges, w = draw residues.
     overlay: vec4<f32>,
 };
 
@@ -147,7 +148,7 @@ fn wall_along_axis(
         let traversal = state[channel];
         let jump = state[channel + 1u];
 
-        if jump != 0u {
+        if jump != 0u && u.overlay.z > 0.5 {
             // The integration moved the phase by something other than the
             // wrapped difference across this edge.
             out.color = HIGHLIGHT_COLOR;
@@ -170,7 +171,7 @@ fn residue_overlay(p: vec2<f32>, extent: vec2<f32>, pixels_per_cell: f32) -> Wal
     out.coverage = 0.0;
 
     let radius_px = u.overlay.y;
-    if u.overlay.x <= 0.5 || radius_px <= 0.0 {
+    if u.overlay.x <= 0.5 || u.overlay.w <= 0.5 || radius_px <= 0.0 {
         return out;
     }
 

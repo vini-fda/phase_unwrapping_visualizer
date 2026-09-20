@@ -7,7 +7,7 @@ use crate::colormap::DisplayMode;
 use crate::demo::{Scene, SceneSettings};
 use crate::graph::Unwrapping;
 use crate::phase::PhaseField;
-use crate::render::{GridRenderer, OverlaySource};
+use crate::render::{GridRenderer, OverlayOptions, OverlaySource};
 use crate::ui::{Colorbar, HoverInfo, PhaseImage, ZOOM_STEP, hover_at, interact, node_view};
 use crate::view::ViewTransform;
 
@@ -114,6 +114,7 @@ pub struct PhaseVisualizerApp {
     representation: Representation,
     mode: DisplayMode,
     settings: SceneSettings,
+    overlay_options: OverlayOptions,
 
     /// Pan/zoom, shared by both tabs and both representations: the fields have
     /// the same shape, so switching never moves the view.
@@ -142,6 +143,7 @@ impl Default for PhaseVisualizerApp {
             representation: Representation::default(),
             mode: DisplayMode::default(),
             settings: SceneSettings::default(),
+            overlay_options: OverlayOptions::default(),
             view: None,
             scene: None,
             hover: None,
@@ -215,6 +217,7 @@ impl PhaseVisualizerApp {
         (self.tab == Tab::Unwrapped && self.representation == Representation::Cell).then(|| {
             OverlaySource {
                 unwrapping: Arc::clone(&scene.unwrapping),
+                options: self.overlay_options,
             }
         })
     }
@@ -314,7 +317,7 @@ impl PhaseVisualizerApp {
     }
 
     /// Counts and the legend for the integration overlay.
-    fn integration_section(&self, ui: &mut egui::Ui) {
+    fn integration_section(&mut self, ui: &mut egui::Ui) {
         let Some(scene) = self.scene.as_ref() else {
             return;
         };
@@ -341,15 +344,29 @@ impl PhaseVisualizerApp {
             .on_hover_text("At least max(N+, N−), at most (m−1)(n−1)");
 
         if self.representation == Representation::Cell {
-            ui.add_space(8.0);
-            ui.label("Legend");
-            swatch(
-                ui,
-                egui::Color32::from_rgb(232, 23, 135),
-                "delta ≠ wrapped delta",
+            ui.add_space(10.0);
+            ui.label("Overlay");
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.overlay_options.highlight_edges, "");
+                swatch(ui, HIGHLIGHT_SWATCH, "delta ≠ wrapped delta");
+            })
+            .response
+            .on_hover_text(
+                "Colour the edges the integration moved by something other than the \
+                 wrapped delta. Turned off, they revert to the wall their role in the \
+                 integration path calls for.",
             );
-            swatch(ui, egui::Color32::from_rgb(245, 130, 31), "residue +1");
-            swatch(ui, egui::Color32::from_rgb(92, 199, 232), "residue −1");
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.overlay_options.show_residues, "");
+                swatch(ui, RESIDUE_POSITIVE_SWATCH, "residue +1");
+                swatch(ui, RESIDUE_NEGATIVE_SWATCH, "residue −1");
+            })
+            .response
+            .on_hover_text("Draw the charges at the inner corners");
+
+            ui.add_space(4.0);
             ui.weak("solid wall = cut edge");
             ui.weak("dashed wall = integration path");
         }
@@ -455,6 +472,11 @@ impl PhaseVisualizerApp {
         }
     }
 }
+
+/// Legend colours, matching the constants in `grid.wgsl`.
+const HIGHLIGHT_SWATCH: egui::Color32 = egui::Color32::from_rgb(232, 23, 135);
+const RESIDUE_POSITIVE_SWATCH: egui::Color32 = egui::Color32::from_rgb(245, 130, 31);
+const RESIDUE_NEGATIVE_SWATCH: egui::Color32 = egui::Color32::from_rgb(92, 199, 232);
 
 /// A colour chip with a caption, for the overlay legend.
 fn swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {

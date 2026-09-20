@@ -142,7 +142,7 @@ impl PhaseImage<'_> {
             pixels_per_cell,
             self.value_range,
             self.mode.is_wrapped(),
-            self.overlay.is_some(),
+            self.overlay.as_ref().map(|overlay| overlay.options),
         );
 
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(

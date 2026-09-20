@@ -69,6 +69,33 @@ pub fn residue_radius(pixels_per_cell: f32) -> f32 {
     (pixels_per_cell * RESIDUE_RADIUS_PER_CELL).clamp(RESIDUE_MIN_RADIUS_PX, RESIDUE_MAX_RADIUS_PX)
 }
 
+/// Which parts of the unwrapping overlay to draw.
+///
+/// These only reach the shader as uniforms, so toggling one costs nothing:
+/// the edge and residue textures stay exactly as they were uploaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct OverlayOptions {
+    /// Colour the edges whose integration delta is not the wrapped delta.
+    ///
+    /// Turning this off does not hide those edges — they fall back to the wall
+    /// their role in the integration path calls for, so the cut/tree structure
+    /// stays readable underneath.
+    pub highlight_edges: bool,
+
+    /// Draw the residue charges at the inner corners.
+    pub show_residues: bool,
+}
+
+impl Default for OverlayOptions {
+    fn default() -> Self {
+        Self {
+            highlight_edges: true,
+            show_residues: true,
+        }
+    }
+}
+
 /// The uniform block handed to `grid.wgsl`.
 ///
 /// Encoded as four `vec4<f32>`, matching `struct Uniforms` there. Grouping
@@ -98,6 +125,10 @@ pub struct GridUniforms {
     pub overlay_enabled: f32,
     /// Radius of a residue marker, in physical pixels.
     pub residue_radius_px: f32,
+    /// `1.0` to colour the edges whose delta disagrees.
+    pub highlight_edges: f32,
+    /// `1.0` to draw the residue markers.
+    pub show_residues: f32,
 }
 
 impl GridUniforms {
@@ -117,7 +148,7 @@ impl GridUniforms {
         pixels_per_cell: f32,
         value_range: (f32, f32),
         wrapped: bool,
-        overlay: bool,
+        overlay: Option<OverlayOptions>,
     ) -> Self {
         let (min, max) = value_range;
         // A degenerate range would divide by zero; map the whole field to the
@@ -138,8 +169,10 @@ impl GridUniforms {
             value_range_inv,
             wrap_mode: if wrapped { 1.0 } else { 0.0 },
             wall_opacity: wall_opacity(pixels_per_cell),
-            overlay_enabled: if overlay { 1.0 } else { 0.0 },
+            overlay_enabled: flag(overlay.is_some()),
             residue_radius_px: residue_radius(pixels_per_cell),
+            highlight_edges: flag(overlay.is_some_and(|overlay| overlay.highlight_edges)),
+            show_residues: flag(overlay.is_some_and(|overlay| overlay.show_residues)),
         }
     }
 
@@ -167,8 +200,8 @@ impl GridUniforms {
             // overlay
             self.overlay_enabled,
             self.residue_radius_px,
-            0.0,
-            0.0,
+            self.highlight_edges,
+            self.show_residues,
         ];
 
         let mut bytes = [0u8; Self::SIZE];
@@ -792,6 +825,11 @@ impl GridRenderer {
     }
 }
 
+/// The shader spells booleans as floats.
+fn flag(on: bool) -> f32 {
+    if on { 1.0 } else { 0.0 }
+}
+
 /// Whether an uploaded copy is stale and has to be replaced.
 ///
 /// Identity, not contents or size: the viewer shows several fields of exactly
@@ -839,6 +877,10 @@ pub struct OverlaySource {
     /// The analysed unwrapping. Replacing it with a different `Arc` is what
     /// tells the renderer to re-upload.
     pub unwrapping: Arc<Unwrapping>,
+
+    /// Which parts of it to draw. Uniform-only, so changing this does not
+    /// invalidate the uploaded textures.
+    pub options: OverlayOptions,
 }
 
 impl GridCallback {
@@ -908,7 +950,7 @@ mod tests {
             12.0,
             (-1.0, 3.0),
             false,
-            false,
+            None,
         )
     }
 
@@ -946,7 +988,7 @@ mod tests {
                 0.25,
                 0.0,
                 1.0, //
-                // overlay: disabled, residue radius, two spare slots
+                // overlay: disabled, residue radius, then the two toggles
                 0.0,
                 residue_radius(12.0),
                 0.0,
@@ -958,7 +1000,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_value_range_maps_to_the_middle_of_the_colormap() {
-        let flat = GridUniforms::new(Rect::ZERO, 2, 2, 10.0, (7.0, 7.0), false, false);
+        let flat = GridUniforms::new(Rect::ZERO, 2, 2, 10.0, (7.0, 7.0), false, None);
         let t = (7.0 - flat.value_min) * flat.value_range_inv;
         assert!(
             (t - 0.5).abs() < 1e-6,
@@ -968,8 +1010,8 @@ mod tests {
 
     #[test]
     fn wrap_mode_is_a_flag() {
-        let wrapped = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), true, false);
-        let plain = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), false, false);
+        let wrapped = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), true, None);
+        let plain = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), false, None);
         assert_eq!(wrapped.wrap_mode, 1.0, "wrapped mode sets the flag");
         assert_eq!(plain.wrap_mode, 0.0, "unbounded mode clears it");
     }
@@ -995,12 +1037,74 @@ mod tests {
         );
     }
 
+    /// Each checkbox has to reach the shader on its own: the two were once a
+    /// single "overlay on" flag, and nothing else tells them apart.
+    #[test]
+    fn each_overlay_toggle_reaches_the_shader_independently() {
+        for (highlight_edges, show_residues) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let uniforms = GridUniforms::new(
+                Rect::ZERO,
+                4,
+                4,
+                10.0,
+                (0.0, 1.0),
+                false,
+                Some(OverlayOptions {
+                    highlight_edges,
+                    show_residues,
+                }),
+            );
+
+            assert_eq!(
+                uniforms.overlay_enabled, 1.0,
+                "the overlay itself is still on whatever the toggles say"
+            );
+            assert_eq!(
+                uniforms.highlight_edges,
+                flag(highlight_edges),
+                "highlight_edges = {highlight_edges} must survive to the shader"
+            );
+            assert_eq!(
+                uniforms.show_residues,
+                flag(show_residues),
+                "show_residues = {show_residues} must survive to the shader"
+            );
+        }
+    }
+
+    /// With no overlay at all, neither toggle may leak through — the wrapped
+    /// tab has no integration path and no residues to draw.
+    #[test]
+    fn no_overlay_clears_every_toggle() {
+        let uniforms = uniforms();
+        assert_eq!(uniforms.overlay_enabled, 0.0, "no overlay");
+        assert_eq!(uniforms.highlight_edges, 0.0, "and so no highlighting");
+        assert_eq!(uniforms.show_residues, 0.0, "and no residues");
+    }
+
+    #[test]
+    fn both_overlays_are_on_by_default() {
+        let options = OverlayOptions::default();
+        assert!(options.highlight_edges, "highlighting starts enabled");
+        assert!(options.show_residues, "residues start enabled");
+    }
+
     #[test]
     fn the_overlay_flag_reaches_the_shader() {
         let off = uniforms();
         assert_eq!(off.overlay_enabled, 0.0, "plain fields draw no overlay");
 
-        let on = GridUniforms::new(Rect::ZERO, 4, 4, 10.0, (0.0, 1.0), false, true);
+        let on = GridUniforms::new(
+            Rect::ZERO,
+            4,
+            4,
+            10.0,
+            (0.0, 1.0),
+            false,
+            Some(OverlayOptions::default()),
+        );
         assert_eq!(on.overlay_enabled, 1.0, "the overlay sets the flag");
     }
 
