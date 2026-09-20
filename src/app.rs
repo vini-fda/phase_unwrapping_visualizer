@@ -14,18 +14,38 @@ use crate::view::ViewTransform;
 /// Which field the viewer is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum Tab {
-    /// The observable phase, wrapped into `(-π, π]`.
+    /// The phase before wrapping: what the unwrapping is trying to recover.
+    ///
+    /// Demo-only. A real interferogram arrives already wrapped and there is
+    /// nothing to compare against — which is the whole difficulty.
     #[default]
+    Truth,
+    /// The observable phase, wrapped into `(-π, π]`.
     Wrapped,
     /// A candidate unwrapping of it, with the integration path that produced it.
     Unwrapped,
 }
 
 impl Tab {
+    /// The tabs in pipeline order: the phase, what is observed of it, and what
+    /// is recovered from that.
+    const ALL: [Self; 3] = [Self::Truth, Self::Wrapped, Self::Unwrapped];
+
     fn label(self) -> &'static str {
         match self {
+            Self::Truth => "Truth",
             Self::Wrapped => "Wrapped",
             Self::Unwrapped => "Unwrapped",
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Truth => {
+                "φ before wrapping — the ramp the demo generated. Not observable in practice."
+            }
+            Self::Wrapped => "ψ = wrap(truth), the observable phase in (-π, π]",
+            Self::Unwrapped => "A candidate unwrapping of ψ, and the path that produced it",
         }
     }
 }
@@ -54,14 +74,15 @@ impl Representation {
 /// The two tabs hold two *separate* `Arc`s, which is what the renderer keys its
 /// uploads on: handing it a different one is what makes it refresh the GPU.
 struct Loaded {
-    /// The observable phase ψ, already inside `(-π, π]`. This is what the
-    /// wrapped tab shows — not the ground truth behind it, which no real
-    /// interferogram comes with.
+    /// The phase before wrapping, shown by the truth tab.
+    truth: Arc<PhaseField>,
+    /// The observable phase ψ, already inside `(-π, π]`.
     wrapped: Arc<PhaseField>,
     /// The candidate unwrapping φ, shared with the render callback.
     unwrapped: Arc<PhaseField>,
     /// The analysis behind the overlay.
     unwrapping: Arc<Unwrapping>,
+    truth_range: (f32, f32),
     wrapped_range: (f32, f32),
     unwrapped_range: (f32, f32),
 }
@@ -70,8 +91,10 @@ impl Loaded {
     fn new(scene: Scene) -> Self {
         let unwrapped = Arc::new(scene.unwrapping.unwrapped().clone());
         Self {
+            truth_range: scene.truth.finite_range().unwrap_or((0.0, 1.0)),
             wrapped_range: scene.wrapped.finite_range().unwrap_or((0.0, 1.0)),
             unwrapped_range: unwrapped.finite_range().unwrap_or((0.0, 1.0)),
+            truth: Arc::new(scene.truth),
             wrapped: Arc::new(scene.wrapped),
             unwrapped,
             unwrapping: Arc::new(scene.unwrapping),
@@ -173,6 +196,7 @@ impl PhaseVisualizerApp {
     fn displayed(&self) -> Option<(&Arc<PhaseField>, (f32, f32))> {
         let scene = self.scene.as_ref()?;
         let (field, range) = match self.tab {
+            Tab::Truth => (&scene.truth, scene.truth_range),
             Tab::Wrapped => (&scene.wrapped, scene.wrapped_range),
             Tab::Unwrapped => (&scene.unwrapped, scene.unwrapped_range),
         };
@@ -197,8 +221,9 @@ impl PhaseVisualizerApp {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for tab in [Tab::Wrapped, Tab::Unwrapped] {
-                ui.selectable_value(&mut self.tab, tab, tab.label());
+            for tab in Tab::ALL {
+                ui.selectable_value(&mut self.tab, tab, tab.label())
+                    .on_hover_text(tab.tooltip());
             }
             if self.tab == Tab::Unwrapped {
                 ui.separator();
@@ -220,6 +245,7 @@ impl PhaseVisualizerApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading(match self.tab {
+                Tab::Truth => "Original phase",
                 Tab::Wrapped => "Wrapped phase",
                 Tab::Unwrapped => "Candidate unwrapping",
             });
@@ -500,22 +526,82 @@ mod tests {
     /// same allocation, a tab switch would be invisible to it and the previous
     /// tab's samples would stay on screen.
     #[test]
-    fn the_two_tabs_hand_over_distinct_fields() {
+    fn every_tab_hands_over_a_distinct_field() {
         let mut app = app();
 
+        let fields: Vec<(Tab, Arc<PhaseField>)> = Tab::ALL
+            .into_iter()
+            .map(|tab| {
+                app.tab = tab;
+                (tab, field_of(&app))
+            })
+            .collect();
+
+        for (i, (tab, field)) in fields.iter().enumerate() {
+            for (other_tab, other) in &fields[i + 1..] {
+                assert!(
+                    !Arc::ptr_eq(field, other),
+                    "{tab:?} and {other_tab:?} must own separate fields, \
+                     or the GPU cache cannot tell them apart"
+                );
+                assert_ne!(
+                    field.as_slice(),
+                    other.as_slice(),
+                    "{tab:?} and {other_tab:?} must not show the same samples"
+                );
+            }
+        }
+    }
+
+    /// The three tabs are the pipeline in order, and the middle one is defined
+    /// as the wrapping of the first. Pinning that keeps the demo honest: if
+    /// they ever drifted apart, the wrapped tab would stop being an observation
+    /// of anything.
+    #[test]
+    fn the_wrapped_tab_is_the_truth_tab_wrapped() {
+        let mut app = app();
+
+        app.tab = Tab::Truth;
+        let truth = field_of(&app);
         app.tab = Tab::Wrapped;
         let wrapped = field_of(&app);
-        app.tab = Tab::Unwrapped;
-        let unwrapped = field_of(&app);
 
+        for (index, (&original, &observed)) in
+            truth.as_slice().iter().zip(wrapped.as_slice()).enumerate()
+        {
+            assert_eq!(
+                observed,
+                crate::phase::wrap(original),
+                "sample {index}: ψ must be wrap(truth)"
+            );
+        }
+    }
+
+    /// The truth tab shows the phase before wrapping, so it spans many turns.
+    #[test]
+    fn the_truth_tab_shows_the_unwrapped_ramp() {
+        let mut app = app();
+        app.tab = Tab::Truth;
+        app.mode = DisplayMode::Unbounded;
+
+        let (field, range) = app.displayed().expect("a scene is loaded");
         assert!(
-            !Arc::ptr_eq(&wrapped, &unwrapped),
-            "each tab must own its own field, or the GPU cache cannot tell them apart"
+            field.as_slice().iter().any(|value| value.abs() > PI),
+            "the original phase should leave (-π, π]"
         );
-        assert_ne!(
-            wrapped.as_slice(),
-            unwrapped.as_slice(),
-            "the two tabs must not show the same samples"
+        assert!(
+            range.1 - range.0 > 2.0 * PI,
+            "and its grayscale range should be wider than one turn, got {range:?}"
+        );
+    }
+
+    #[test]
+    fn the_truth_tab_comes_first() {
+        assert_eq!(Tab::ALL[0], Tab::Truth, "the pipeline starts at the phase");
+        assert_eq!(
+            Tab::default(),
+            Tab::Truth,
+            "and that is where a fresh viewer lands"
         );
     }
 
@@ -588,6 +674,8 @@ mod tests {
         let mut app = app();
 
         for (tab, representation, expected) in [
+            (Tab::Truth, Representation::Cell, false),
+            (Tab::Truth, Representation::Node, false),
             (Tab::Wrapped, Representation::Cell, false),
             (Tab::Wrapped, Representation::Node, false),
             (Tab::Unwrapped, Representation::Cell, true),
