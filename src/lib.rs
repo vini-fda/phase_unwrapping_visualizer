@@ -9,6 +9,8 @@ mod ui;
 // The domain core: no rendering, fully unit tested, and what later features
 // (residues, branch cuts, unwrapping itself) will be written against.
 pub mod colormap;
+pub mod demo;
+pub mod graph;
 pub mod phase;
 pub mod view;
 

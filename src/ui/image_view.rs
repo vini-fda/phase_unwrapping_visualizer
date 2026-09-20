@@ -7,7 +7,7 @@ use egui::{CursorIcon, Key, Pos2, Rect, Response, Sense, Ui};
 
 use crate::colormap::DisplayMode;
 use crate::phase::{self, PhaseField};
-use crate::render::{GridCallback, GridUniforms};
+use crate::render::{GridCallback, GridUniforms, OverlaySource};
 use crate::view::ViewTransform;
 
 /// Zoom applied per notch of the scroll wheel, as an exponent: zooming is
@@ -46,10 +46,6 @@ pub struct PhaseImage<'a> {
     /// Samples to draw. Shared with the render callback rather than copied.
     pub field: &'a Arc<PhaseField>,
 
-    /// Changes whenever `field`'s contents change, so the GPU copy can be
-    /// invalidated without comparing the data itself.
-    pub generation: u64,
-
     /// How to colour the samples.
     pub mode: DisplayMode,
 
@@ -63,37 +59,77 @@ pub struct PhaseImage<'a> {
     /// A zoom factor requested from outside, e.g. by a toolbar button. `1.0`
     /// for none; applied about the centre of the view rather than the pointer.
     pub external_zoom: f32,
+
+    /// An unwrapping to draw over the field: per-edge wall colours and residue
+    /// markers. `None` draws the field alone.
+    pub overlay: Option<OverlaySource>,
+}
+
+/// Allocates the viewer's area and applies this frame's pan and zoom, without
+/// drawing anything into it.
+///
+/// Both representations share this, so a gesture means the same thing in
+/// either and switching between them never moves the view.
+pub fn interact(
+    ui: &mut Ui,
+    rows: usize,
+    cols: usize,
+    view: &mut Option<ViewTransform>,
+    external_zoom: f32,
+) -> (Rect, Response) {
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+
+    let transform = view.get_or_insert_with(|| ViewTransform::fit(rows, cols, rect));
+
+    if response.dragged() {
+        transform.pan_by_screen_delta(response.drag_delta());
+    }
+
+    if (external_zoom - 1.0).abs() > ZOOM_EPSILON {
+        transform.zoom_about(rect.center(), external_zoom, rect);
+    }
+
+    if response.hovered() {
+        let factor = zoom_from_input(ui);
+        if (factor - 1.0).abs() > ZOOM_EPSILON {
+            let anchor = response.hover_pos().unwrap_or_else(|| rect.center());
+            transform.zoom_about(anchor, factor, rect);
+        }
+    }
+
+    let response = if response.dragged() {
+        response.on_hover_cursor(CursorIcon::Grabbing)
+    } else {
+        response.on_hover_cursor(CursorIcon::Grab)
+    };
+
+    (rect, response)
+}
+
+/// The cell under the pointer, for the sidebar readout.
+pub fn hover_at(
+    view: &ViewTransform,
+    field: &PhaseField,
+    response: &Response,
+    rect: Rect,
+) -> Option<HoverInfo> {
+    let pointer = response.hover_pos()?;
+    cell_at(view, field, pointer, rect)
 }
 
 impl PhaseImage<'_> {
     /// Draws the image, taking up all the remaining space in `ui`.
     pub fn show(self, ui: &mut Ui) -> PhaseImageOutput {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let (rows, cols) = (self.field.rows(), self.field.cols());
+        let (rect, response) = interact(ui, rows, cols, self.view, self.external_zoom);
 
         let view = self
             .view
-            .get_or_insert_with(|| ViewTransform::fit(rows, cols, rect));
+            .as_ref()
+            .copied()
+            .unwrap_or_else(|| ViewTransform::fit(rows, cols, rect));
 
-        if response.dragged() {
-            view.pan_by_screen_delta(response.drag_delta());
-        }
-
-        if (self.external_zoom - 1.0).abs() > ZOOM_EPSILON {
-            view.zoom_about(rect.center(), self.external_zoom, rect);
-        }
-
-        if response.hovered() {
-            let factor = zoom_from_input(ui);
-            if (factor - 1.0).abs() > ZOOM_EPSILON {
-                let anchor = response.hover_pos().unwrap_or_else(|| rect.center());
-                view.zoom_about(anchor, factor, rect);
-            }
-        }
-
-        let hover = response
-            .hover_pos()
-            .and_then(|pointer| cell_at(view, self.field, pointer, rect));
+        let hover = hover_at(&view, self.field, &response, rect);
 
         // `points_per_cell` is in egui points; the shader sizes cell walls in
         // physical pixels, so the display's scale factor belongs here.
@@ -106,23 +142,14 @@ impl PhaseImage<'_> {
             pixels_per_cell,
             self.value_range,
             self.mode.is_wrapped(),
+            self.overlay.is_some(),
         );
 
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
-            GridCallback::new(
-                Arc::clone(self.field),
-                self.generation,
-                self.mode.colormap(),
-                uniforms,
-            ),
+            GridCallback::new(Arc::clone(self.field), self.mode.colormap(), uniforms)
+                .with_overlay(self.overlay),
         ));
-
-        let response = if response.dragged() {
-            response.on_hover_cursor(CursorIcon::Grabbing)
-        } else {
-            response.on_hover_cursor(CursorIcon::Grab)
-        };
 
         PhaseImageOutput { response, hover }
     }

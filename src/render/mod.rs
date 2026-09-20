@@ -18,6 +18,7 @@ use eframe::wgpu;
 use egui::Rect;
 
 use crate::colormap::Colormap;
+use crate::graph::Unwrapping;
 use crate::phase::PhaseField;
 
 /// Number of entries in the colormap lookup texture.
@@ -50,9 +51,27 @@ fn smoothstep(low: f32, high: f32, x: f32) -> f32 {
     t * t * 2.0f32.mul_add(-t, 3.0)
 }
 
+/// Smallest radius a residue marker is drawn at, in physical pixels.
+///
+/// Residues do not fade with zoom the way walls do: they are sparse, and they
+/// are the obstruction that forces any edge to disagree at all, so they stay
+/// findable when the whole field is on screen.
+const RESIDUE_MIN_RADIUS_PX: f32 = 2.5;
+
+/// Largest radius a residue marker is drawn at, in physical pixels.
+const RESIDUE_MAX_RADIUS_PX: f32 = 7.0;
+
+/// Residue radius as a fraction of a cell, between those two bounds.
+const RESIDUE_RADIUS_PER_CELL: f32 = 0.16;
+
+/// How large to draw the residue markers at a given zoom.
+pub fn residue_radius(pixels_per_cell: f32) -> f32 {
+    (pixels_per_cell * RESIDUE_RADIUS_PER_CELL).clamp(RESIDUE_MIN_RADIUS_PX, RESIDUE_MAX_RADIUS_PX)
+}
+
 /// The uniform block handed to `grid.wgsl`.
 ///
-/// Encoded as three `vec4<f32>`, matching `struct Uniforms` there. Grouping
+/// Encoded as four `vec4<f32>`, matching `struct Uniforms` there. Grouping
 /// everything into `vec4`s means the uniform-address-space alignment rules are
 /// satisfied by construction, with no padding fields to keep in sync.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,17 +94,22 @@ pub struct GridUniforms {
     pub wrap_mode: f32,
     /// Wall opacity, from [`wall_opacity`].
     pub wall_opacity: f32,
+    /// `1.0` to draw the unwrapping overlay, `0.0` to draw the field alone.
+    pub overlay_enabled: f32,
+    /// Radius of a residue marker, in physical pixels.
+    pub residue_radius_px: f32,
 }
 
 impl GridUniforms {
-    /// Size of the encoded block, in bytes: three `vec4<f32>`.
-    pub const SIZE: usize = 48;
+    /// Size of the encoded block, in bytes: four `vec4<f32>`.
+    pub const SIZE: usize = 64;
 
     /// Builds the uniforms for one frame.
     ///
     /// `visible` is the data-space rectangle covered by the widget, and
     /// `pixels_per_cell` is in *physical* pixels, so the wall width and its
     /// fade behave the same on a high-DPI display as on a normal one.
+    /// `overlay` turns on the per-edge wall colours and residue markers.
     pub fn new(
         visible: Rect,
         rows: usize,
@@ -93,6 +117,7 @@ impl GridUniforms {
         pixels_per_cell: f32,
         value_range: (f32, f32),
         wrapped: bool,
+        overlay: bool,
     ) -> Self {
         let (min, max) = value_range;
         // A degenerate range would divide by zero; map the whole field to the
@@ -113,6 +138,8 @@ impl GridUniforms {
             value_range_inv,
             wrap_mode: if wrapped { 1.0 } else { 0.0 },
             wall_opacity: wall_opacity(pixels_per_cell),
+            overlay_enabled: if overlay { 1.0 } else { 0.0 },
+            residue_radius_px: residue_radius(pixels_per_cell),
         }
     }
 
@@ -121,7 +148,7 @@ impl GridUniforms {
     /// Done by hand rather than by transmuting a `#[repr(C)]` struct: the crate
     /// forbids `unsafe`, and this keeps the layout explicit and testable.
     fn to_bytes(self) -> [u8; Self::SIZE] {
-        let floats: [f32; 12] = [
+        let floats: [f32; 16] = [
             // bounds
             self.data_min[0],
             self.data_min[1],
@@ -137,6 +164,11 @@ impl GridUniforms {
             self.value_range_inv,
             self.wrap_mode,
             self.wall_opacity,
+            // overlay
+            self.overlay_enabled,
+            self.residue_radius_px,
+            0.0,
+            0.0,
         ];
 
         let mut bytes = [0u8; Self::SIZE];
@@ -153,7 +185,16 @@ struct DataTexture {
     texture: wgpu::Texture,
     rows: usize,
     cols: usize,
-    generation: u64,
+
+    /// The field these texels came from.
+    ///
+    /// Holding the `Arc` is what makes the staleness check sound: while it is
+    /// alive nothing else can occupy that allocation, so pointer equality means
+    /// the same immutable samples. A hand-maintained counter cannot do this —
+    /// the viewer shows two different fields of identical size, and a counter
+    /// that identified only the *scene* let a tab switch slip through and left
+    /// the other tab's samples on screen.
+    source: Arc<PhaseField>,
 }
 
 /// The colormap, uploaded as a 1-D RGBA8 ramp.
@@ -163,6 +204,14 @@ struct DataTexture {
 struct LutTexture {
     view: wgpu::TextureView,
     colormap: Colormap,
+}
+
+/// The per-edge and per-corner overlay data, uploaded as integer textures.
+struct OverlayTextures {
+    edges: wgpu::TextureView,
+    residues: wgpu::TextureView,
+    /// The analysis these texels came from; see [`DataTexture::source`].
+    source: Arc<Unwrapping>,
 }
 
 /// Everything the grid needs on the GPU, kept in `egui_wgpu`'s callback
@@ -176,6 +225,14 @@ pub struct GridRenderer {
 
     data: Option<DataTexture>,
     lut: Option<LutTexture>,
+    overlay: Option<OverlayTextures>,
+
+    /// Bound whenever there is no overlay, so the bind group is always
+    /// complete and the shader's `overlay_enabled` flag is the only thing
+    /// deciding whether the data is read.
+    empty_edges: wgpu::TextureView,
+    empty_residues: wgpu::TextureView,
+
     bind_group: Option<wgpu::BindGroup>,
 
     /// Size already reported as too large, so the log is not spammed every frame.
@@ -229,6 +286,21 @@ impl GridRenderer {
             max_texture_dimension: device.limits().max_texture_dimension_2d,
             data: None,
             lut: None,
+            overlay: None,
+            empty_edges: create_uint_texture(
+                device,
+                "phase_grid_empty_edges",
+                wgpu::TextureFormat::Rgba8Uint,
+                1,
+                1,
+            ),
+            empty_residues: create_uint_texture(
+                device,
+                "phase_grid_empty_residues",
+                wgpu::TextureFormat::R8Uint,
+                1,
+                1,
+            ),
             bind_group: None,
             reported_oversize: None,
         }
@@ -279,8 +351,105 @@ fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
+}
+
+/// Creates an integer texture that the shader reads with `textureLoad`.
+fn create_uint_texture(
+    device: &wgpu::Device,
+    label: &str,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Uploads `data` into a freshly created integer texture.
+///
+/// `size` is `(cols, rows)`; the row stride is derived from the format, so the
+/// caller cannot get it out of step with it.
+fn upload_uint_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    format: wgpu::TextureFormat,
+    size: (usize, usize),
+    data: &[u8],
+) -> wgpu::TextureView {
+    let (cols, rows) = size;
+    let bytes_per_texel = format.block_copy_size(None).unwrap_or(1) as usize;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: dimension(cols),
+            height: dimension(rows),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(dimension(cols * bytes_per_texel)),
+            rows_per_image: Some(dimension(rows)),
+        },
+        wgpu::Extent3d {
+            width: dimension(cols),
+            height: dimension(rows),
+            depth_or_array_layers: 1,
+        },
+    );
+
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 /// Builds the render pipeline for the grid.
@@ -358,10 +527,11 @@ impl GridRenderer {
     /// Brings the GPU-side copies of the field and colormap up to date and
     /// writes this frame's uniforms.
     fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, callback: &GridCallback) {
-        let data_changed = self.sync_data(device, queue, &callback.field, callback.generation);
+        let data_changed = self.sync_data(device, queue, &callback.field);
         let lut_changed = self.sync_lut(device, queue, callback.colormap);
+        let overlay_changed = self.sync_overlay(device, queue, callback.overlay.as_ref());
 
-        if data_changed || lut_changed || self.bind_group.is_none() {
+        if data_changed || lut_changed || overlay_changed || self.bind_group.is_none() {
             self.rebuild_bind_group(device);
         }
 
@@ -373,8 +543,7 @@ impl GridRenderer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        field: &PhaseField,
-        generation: u64,
+        field: &Arc<PhaseField>,
     ) -> bool {
         let (rows, cols) = (field.rows(), field.cols());
 
@@ -395,12 +564,16 @@ impl GridRenderer {
         }
         self.reported_oversize = None;
 
-        let matches = self
+        if !needs_upload(self.data.as_ref().map(|data| &data.source), field) {
+            return false;
+        }
+
+        let reusable = self
             .data
             .as_ref()
             .is_some_and(|data| data.rows == rows && data.cols == cols);
 
-        let replaced = if matches {
+        let replaced = if reusable {
             false
         } else {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -423,8 +596,7 @@ impl GridRenderer {
                 texture,
                 rows,
                 cols,
-                // Force the upload below.
-                generation: generation.wrapping_sub(1),
+                source: Arc::clone(field),
             });
             true
         };
@@ -433,7 +605,7 @@ impl GridRenderer {
             return replaced;
         };
 
-        if data.generation != generation {
+        {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &data.texture,
@@ -453,7 +625,7 @@ impl GridRenderer {
                     depth_or_array_layers: 1,
                 },
             );
-            data.generation = generation;
+            data.source = Arc::clone(field);
         }
 
         replaced
@@ -509,34 +681,104 @@ impl GridRenderer {
         true
     }
 
+    /// Uploads the overlay textures when the unwrapping behind them changes.
+    ///
+    /// Returns `true` if the bound views changed.
+    fn sync_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: Option<&OverlaySource>,
+    ) -> bool {
+        let Some(source) = source else {
+            return self.overlay.take().is_some();
+        };
+
+        let (rows, cols) = (source.unwrapping.rows(), source.unwrapping.cols());
+        if rows < 2 || cols < 2 {
+            // Fewer than two rows or columns leaves no inner corner, so there
+            // is no residue texture to build.
+            return self.overlay.take().is_some();
+        }
+
+        if !needs_upload(
+            self.overlay.as_ref().map(|overlay| &overlay.source),
+            &source.unwrapping,
+        ) {
+            return false;
+        }
+
+        let edges = upload_uint_texture(
+            device,
+            queue,
+            "phase_grid_edges",
+            wgpu::TextureFormat::Rgba8Uint,
+            (cols, rows),
+            &source.unwrapping.edge_texels(),
+        );
+        let residues = upload_uint_texture(
+            device,
+            queue,
+            "phase_grid_residues",
+            wgpu::TextureFormat::R8Uint,
+            (cols - 1, rows - 1),
+            &source.unwrapping.residue_texels(),
+        );
+
+        self.overlay = Some(OverlayTextures {
+            edges,
+            residues,
+            source: Arc::clone(&source.unwrapping),
+        });
+        true
+    }
+
     fn rebuild_bind_group(&mut self, device: &wgpu::Device) {
         let (Some(data), Some(lut)) = (self.data.as_ref(), self.lut.as_ref()) else {
             self.bind_group = None;
             return;
         };
 
-        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("phase_grid_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&data.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&lut.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        }));
+        self.bind_group = Some(
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("phase_grid_bind_group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&data.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&lut.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.overlay
+                                .as_ref()
+                                .map_or(&self.empty_edges, |overlay| &overlay.edges),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(
+                            self.overlay
+                                .as_ref()
+                                .map_or(&self.empty_residues, |overlay| &overlay.residues),
+                        ),
+                    },
+                ],
+            }),
+        );
     }
 
     fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
@@ -548,6 +790,17 @@ impl GridRenderer {
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.draw(0..3, 0..1);
     }
+}
+
+/// Whether an uploaded copy is stale and has to be replaced.
+///
+/// Identity, not contents or size: the viewer shows several fields of exactly
+/// the same shape, so anything coarser than "is this the very same allocation"
+/// silently keeps the wrong samples on the GPU. Holding the `Arc` while it is
+/// compared is what makes pointer equality sound — the allocation cannot be
+/// reused underneath it.
+fn needs_upload<T>(uploaded: Option<&Arc<T>>, incoming: &Arc<T>) -> bool {
+    !uploaded.is_some_and(|uploaded| Arc::ptr_eq(uploaded, incoming))
 }
 
 /// Narrows a length to a texture dimension.
@@ -574,26 +827,42 @@ fn to_le_bytes(values: &[f32]) -> Vec<u8> {
 /// so it satisfies the `Send + Sync` bound `CallbackTrait` requires.
 pub struct GridCallback {
     field: Arc<PhaseField>,
-    generation: u64,
     colormap: Colormap,
     uniforms: GridUniforms,
+    overlay: Option<OverlaySource>,
+}
+
+/// The unwrapping whose per-edge and per-corner data should be drawn over the
+/// field.
+#[derive(Clone)]
+pub struct OverlaySource {
+    /// The analysed unwrapping. Replacing it with a different `Arc` is what
+    /// tells the renderer to re-upload.
+    pub unwrapping: Arc<Unwrapping>,
 }
 
 impl GridCallback {
-    /// `generation` must change whenever `field`'s contents change; it is what
-    /// tells the renderer that its uploaded copy is stale.
-    pub fn new(
-        field: Arc<PhaseField>,
-        generation: u64,
-        colormap: Colormap,
-        uniforms: GridUniforms,
-    ) -> Self {
+    /// Draws `field` with `colormap`.
+    ///
+    /// The renderer decides whether its uploaded copy is stale by comparing the
+    /// `Arc` itself, so passing a different field — including simply switching
+    /// which one the UI is showing — is all it takes to refresh the GPU.
+    pub fn new(field: Arc<PhaseField>, colormap: Colormap, uniforms: GridUniforms) -> Self {
         Self {
             field,
-            generation,
             colormap,
             uniforms,
+            overlay: None,
         }
+    }
+
+    /// Draws the unwrapping overlay on top of the field.
+    ///
+    /// Without a matching `overlay_enabled` in the uniforms this is inert, so
+    /// the two are set together by the widget.
+    pub fn with_overlay(mut self, overlay: Option<OverlaySource>) -> Self {
+        self.overlay = overlay;
+        self
     }
 }
 
@@ -639,15 +908,16 @@ mod tests {
             12.0,
             (-1.0, 3.0),
             false,
+            false,
         )
     }
 
     /// The byte layout is the contract with `grid.wgsl`; if it drifts, the image
     /// silently renders garbage rather than failing to compile.
     #[test]
-    fn uniforms_encode_three_vec4s_in_shader_order() {
+    fn uniforms_encode_four_vec4s_in_shader_order() {
         let bytes = uniforms().to_bytes();
-        assert_eq!(bytes.len(), 48, "three vec4<f32> is 48 bytes");
+        assert_eq!(bytes.len(), 64, "four vec4<f32> is 64 bytes");
 
         let decoded: Vec<f32> = bytes
             .chunks_exact(4)
@@ -675,7 +945,12 @@ mod tests {
                 -1.0,
                 0.25,
                 0.0,
-                1.0,
+                1.0, //
+                // overlay: disabled, residue radius, two spare slots
+                0.0,
+                residue_radius(12.0),
+                0.0,
+                0.0,
             ],
             "field order must match `struct Uniforms` in grid.wgsl"
         );
@@ -683,7 +958,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_value_range_maps_to_the_middle_of_the_colormap() {
-        let flat = GridUniforms::new(Rect::ZERO, 2, 2, 10.0, (7.0, 7.0), false);
+        let flat = GridUniforms::new(Rect::ZERO, 2, 2, 10.0, (7.0, 7.0), false, false);
         let t = (7.0 - flat.value_min) * flat.value_range_inv;
         assert!(
             (t - 0.5).abs() < 1e-6,
@@ -693,10 +968,40 @@ mod tests {
 
     #[test]
     fn wrap_mode_is_a_flag() {
-        let wrapped = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), true);
-        let plain = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), false);
+        let wrapped = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), true, false);
+        let plain = GridUniforms::new(Rect::ZERO, 1, 1, 10.0, (0.0, 1.0), false, false);
         assert_eq!(wrapped.wrap_mode, 1.0, "wrapped mode sets the flag");
         assert_eq!(plain.wrap_mode, 0.0, "unbounded mode clears it");
+    }
+
+    /// Residues deliberately do *not* follow the wall fade: they stay visible
+    /// when the whole field is on screen, which is when you need to find them.
+    #[test]
+    fn residue_markers_stay_visible_at_every_zoom() {
+        for pixels_per_cell in [0.05, 1.0, 4.0, 20.0, 400.0] {
+            let radius = residue_radius(pixels_per_cell);
+            assert!(
+                radius >= RESIDUE_MIN_RADIUS_PX,
+                "at {pixels_per_cell} px/cell a residue shrank to {radius} px"
+            );
+            assert!(
+                radius <= RESIDUE_MAX_RADIUS_PX,
+                "at {pixels_per_cell} px/cell a residue grew to {radius} px"
+            );
+        }
+        assert!(
+            residue_radius(1.0) > 0.0 && wall_opacity(1.0) == 0.0,
+            "at one pixel per cell the walls are gone but the residues are not"
+        );
+    }
+
+    #[test]
+    fn the_overlay_flag_reaches_the_shader() {
+        let off = uniforms();
+        assert_eq!(off.overlay_enabled, 0.0, "plain fields draw no overlay");
+
+        let on = GridUniforms::new(Rect::ZERO, 4, 4, 10.0, (0.0, 1.0), false, true);
+        assert_eq!(on.overlay_enabled, 1.0, "the overlay sets the flag");
     }
 
     #[test]
@@ -727,6 +1032,40 @@ mod tests {
             );
             previous = opacity;
         }
+    }
+
+    /// The regression test for the tab-switch bug: the viewer's two tabs hold
+    /// two fields of identical size, so a staleness check based on size — or on
+    /// a counter identifying the scene rather than the field — reported "already
+    /// uploaded" and left the previous tab's samples on screen.
+    #[test]
+    fn identical_fields_from_different_allocations_still_need_uploading() {
+        let uploaded = Arc::new(PhaseField::linear_gradient(8, 8, 1.0, 1.0));
+        let twin = Arc::new(PhaseField::linear_gradient(8, 8, 1.0, 1.0));
+        assert_eq!(
+            uploaded.as_slice(),
+            twin.as_slice(),
+            "the two fields are deliberately indistinguishable by value"
+        );
+
+        assert!(
+            needs_upload(None, &uploaded),
+            "an empty GPU always needs the first upload"
+        );
+        assert!(
+            !needs_upload(Some(&uploaded), &Arc::clone(&uploaded)),
+            "the same field must not be re-uploaded every frame"
+        );
+        assert!(
+            needs_upload(Some(&uploaded), &twin),
+            "a different field of the same shape must still be uploaded"
+        );
+
+        let other_shape = Arc::new(PhaseField::linear_gradient(4, 16, 1.0, 1.0));
+        assert!(
+            needs_upload(Some(&uploaded), &other_shape),
+            "so must one of a different shape"
+        );
     }
 
     #[test]
