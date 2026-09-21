@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use crate::colormap::DisplayMode;
 use crate::demo::{Scene, SceneSettings};
+use crate::file_dialog::FileDialog;
 use crate::graph::Unwrapping;
 use crate::phase::PhaseField;
+use crate::phase_file;
 use crate::render::{GridRenderer, OverlayOptions, OverlaySource};
 use crate::ui::{Colorbar, HoverInfo, PhaseImage, ZOOM_STEP, hover_at, interact, node_view};
 use crate::view::ViewTransform;
@@ -69,6 +71,19 @@ impl Representation {
     }
 }
 
+/// Where the field on show came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Source {
+    /// Generated from [`SceneSettings`].
+    #[default]
+    Demo,
+    /// Read out of a `.phase` file.
+    File {
+        /// What to call it in the UI.
+        name: String,
+    },
+}
+
 /// The scene, plus everything derived from it that the viewer needs per frame.
 ///
 /// The two tabs hold two *separate* `Arc`s, which is what the renderer keys its
@@ -125,6 +140,12 @@ pub struct PhaseVisualizerApp {
     scene: Option<Loaded>,
 
     #[serde(skip)]
+    source: Source,
+
+    #[serde(skip)]
+    dialog: FileDialog,
+
+    #[serde(skip)]
     hover: Option<HoverInfo>,
 
     #[serde(skip)]
@@ -146,6 +167,8 @@ impl Default for PhaseVisualizerApp {
             overlay_options: OverlayOptions::default(),
             view: None,
             scene: None,
+            source: Source::default(),
+            dialog: FileDialog::default(),
             hover: None,
             colorbar: Colorbar::default(),
             error: None,
@@ -192,6 +215,65 @@ impl PhaseVisualizerApp {
         }
         // The old view may be pointing somewhere that no longer exists.
         self.view = None;
+    }
+
+    /// Replaces the scene with one built around a field read from a file.
+    fn load_field(&mut self, name: String, field: PhaseField) {
+        self.hover = None;
+        self.view = None;
+        match Scene::from_truth(field) {
+            Ok(scene) => {
+                self.scene = Some(Loaded::new(scene));
+                self.source = Source::File { name };
+                self.error = None;
+            }
+            Err(error) => {
+                // Keep whatever was on screen; only report why the new file
+                // could not replace it.
+                self.error = Some(format!("{name}: {error}"));
+            }
+        }
+    }
+
+    /// Collects a file the picker or a drag-and-drop has finished reading.
+    fn poll_incoming_file(&mut self, ctx: &egui::Context) {
+        // A dropped file takes the same route as the picker, so both end up
+        // reported the same way.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+            for file in dropped {
+                let name = file
+                    .path()
+                    .file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                match file.bytes() {
+                    Ok(bytes) => self.dialog.accept(name, &bytes),
+                    Err(error) => self.error = Some(format!("{name}: {error}")),
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = ctx;
+
+        if let Some(opened) = self.dialog.take() {
+            match opened.result {
+                Ok(field) => self.load_field(opened.name, field),
+                Err(error) => self.error = Some(format!("{}: {error}", opened.name)),
+            }
+        }
+    }
+
+    /// Loads the example that ships with the crate.
+    fn load_example(&self) {
+        self.dialog
+            .accept(phase_file::EXAMPLE_NAME.to_owned(), phase_file::EXAMPLE);
+    }
+
+    /// Goes back to the generated scene.
+    fn use_demo_data(&mut self) {
+        self.source = Source::Demo;
+        self.rebuild_scene();
     }
 
     /// The field on show, and the values at the two ends of its colormap.
@@ -396,7 +478,20 @@ impl PhaseVisualizerApp {
     /// The knobs behind the synthetic scene.
     fn demo_section(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label("Demo data");
+
+        if let Source::File { name } = self.source.clone() {
+            ui.label("Source");
+            ui.monospace(&name).on_hover_text(&name);
+            if ui.button("Use generated data").clicked() {
+                self.use_demo_data();
+            }
+            if let Some(error) = self.error.as_ref() {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            return;
+        }
+
+        ui.label("Generated data");
 
         let mut changed = false;
         changed |= ui
@@ -518,18 +613,47 @@ impl eframe::App for PhaseVisualizerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_incoming_file(ui.ctx());
+
         egui::Panel::top("top_panel").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                // NOTE: no File->Quit on web pages!
-                let is_web = cfg!(target_arch = "wasm32");
-                if !is_web {
-                    ui.menu_button("File", |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui
+                        .button("Open phase data…")
+                        .on_hover_text("Open a .phase file as the original phase")
+                        .clicked()
+                    {
+                        self.dialog.pick();
+                        ui.close();
+                    }
+                    if ui
+                        .button("Open example")
+                        .on_hover_text(phase_file::EXAMPLE_NAME)
+                        .clicked()
+                    {
+                        self.load_example();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.source != Source::Demo,
+                            egui::Button::new("Use generated data"),
+                        )
+                        .clicked()
+                    {
+                        self.use_demo_data();
+                        ui.close();
+                    }
+
+                    // NOTE: no File->Quit on web pages!
+                    if !cfg!(target_arch = "wasm32") {
+                        ui.separator();
                         if ui.button("Quit").clicked() {
                             ui.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                    });
-                    ui.add_space(16.0);
-                }
+                    }
+                });
+                ui.add_space(16.0);
 
                 egui::widgets::global_theme_preference_buttons(ui);
             });
@@ -710,6 +834,114 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&before, &after),
             "a rebuilt scene must hand the renderer a fresh allocation"
+        );
+    }
+
+    /// Opening a file must replace every field, not just the one on show: the
+    /// wrapped and unwrapped tabs are both derived from the original phase.
+    #[test]
+    fn opening_a_file_replaces_the_whole_scene() {
+        let mut app = app();
+        app.tab = Tab::Truth;
+        let before = field_of(&app);
+
+        let example =
+            crate::phase_file::decode(crate::phase_file::EXAMPLE).expect("the example decodes");
+        app.load_field("example.phase".to_owned(), example);
+
+        assert_eq!(
+            app.source,
+            Source::File {
+                name: "example.phase".to_owned()
+            },
+            "the sidebar must be able to say where the data came from"
+        );
+        assert!(app.error.is_none(), "a good file reports no error");
+
+        let after = field_of(&app);
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the renderer must be handed a fresh allocation"
+        );
+        assert_eq!(
+            (after.rows(), after.cols()),
+            (8, 8),
+            "the example is 8 × 8, not the demo's shape"
+        );
+
+        // Every tab has to follow, not just the one that happened to be open.
+        for tab in Tab::ALL {
+            app.tab = tab;
+            let field = field_of(&app);
+            assert_eq!(
+                (field.rows(), field.cols()),
+                (8, 8),
+                "{tab:?} must show the loaded field's shape"
+            );
+        }
+
+        assert!(
+            app.view.is_none(),
+            "a differently sized field must be re-fitted rather than keeping the old view"
+        );
+    }
+
+    #[test]
+    fn going_back_to_generated_data_restores_the_demo() {
+        let mut app = app();
+        let example =
+            crate::phase_file::decode(crate::phase_file::EXAMPLE).expect("the example decodes");
+        app.load_field("example.phase".to_owned(), example);
+
+        app.use_demo_data();
+
+        assert_eq!(
+            app.source,
+            Source::Demo,
+            "the source goes back to generated"
+        );
+        let field = field_of(&app);
+        assert_eq!(
+            (field.rows(), field.cols()),
+            (app.settings.rows, app.settings.cols),
+            "and the generator's own dimensions come back"
+        );
+    }
+
+    /// A file that cannot be read must not blank the viewer.
+    #[test]
+    fn a_failed_load_keeps_what_was_already_on_screen() {
+        let mut app = app();
+        let before = field_of(&app);
+
+        app.dialog
+            .accept("broken.phase".to_owned(), &crate::phase_file::EXAMPLE[..20]);
+        app.poll_incoming_file(&egui::Context::default());
+
+        assert!(
+            app.error.is_some(),
+            "the failure has to be reported somewhere"
+        );
+        assert_eq!(app.source, Source::Demo, "and the source must not change");
+        assert!(
+            Arc::ptr_eq(&before, &field_of(&app)),
+            "the field on screen must survive a failed open"
+        );
+    }
+
+    #[test]
+    fn the_example_can_be_opened_without_a_filesystem() {
+        let mut app = app();
+        app.load_example();
+        app.poll_incoming_file(&egui::Context::default());
+
+        assert!(app.error.is_none(), "the shipped example must load cleanly");
+        assert_eq!(
+            app.source,
+            Source::File {
+                name: crate::phase_file::EXAMPLE_NAME.to_owned()
+            },
+            "and be named after the file it came from"
         );
     }
 

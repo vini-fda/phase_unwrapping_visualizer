@@ -221,16 +221,29 @@ impl Scene {
     /// field; every other input is constructed here and is valid by
     /// construction.
     pub fn new(settings: SceneSettings) -> Result<Self, UnwrappingError> {
-        let truth = noisy_ramp(
+        Self::from_truth(noisy_ramp(
             settings.rows,
             settings.cols,
             settings.cycles_x,
             settings.cycles_y,
             settings.noise,
             settings.seed,
-        );
+        ))
+    }
+
+    /// Builds a scene around a phase field that came from somewhere else — a
+    /// `.phase` file, say — rather than from the generator.
+    ///
+    /// The field is treated as the phase before wrapping, exactly as the
+    /// generated one is: it is wrapped, integrated along the comb path, and the
+    /// result analysed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnwrappingError::Empty`] if the field has no samples.
+    pub fn from_truth(truth: PhaseField) -> Result<Self, UnwrappingError> {
         let wrapped = wrap_field(&truth);
-        let tree = comb_tree(settings.rows, settings.cols);
+        let tree = comb_tree(truth.rows(), truth.cols());
         let candidate = integrate(&wrapped, &tree)?;
         let unwrapping = Unwrapping::new(&wrapped, candidate, &tree)?;
 
