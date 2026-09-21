@@ -111,6 +111,18 @@ impl Slot {
         }
     }
 
+    /// What the button that gives up this slot's file should say.
+    ///
+    /// Each names the thing it falls back *to*, because "synthetic" means
+    /// something different in each row: a generated field for the original, a
+    /// derivation for the wrapped phase, an algorithm for the candidate.
+    pub fn fallback_label(self) -> &'static str {
+        match self {
+            Self::Original | Self::Wrapped | Self::Path => "Use synthetic",
+            Self::Unwrapped => "Use naive unwrapping algorithm",
+        }
+    }
+
     /// What happens to this slot when its file is given up.
     pub fn fallback_tooltip(self) -> &'static str {
         match self {

@@ -531,26 +531,7 @@ impl PhaseVisualizerApp {
             let state = self.inputs.state(slot);
             ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                ui.strong(slot.label()).on_hover_text(slot.tooltip());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if state.is_supplied()
-                        && ui
-                            .small_button("Use synthetic")
-                            .on_hover_text(slot.fallback_tooltip())
-                            .clicked()
-                    {
-                        revert = Some(slot);
-                    }
-                    if ui
-                        .small_button("Open…")
-                        .on_hover_text(format!("Open a .{} file", slot.extension()))
-                        .clicked()
-                    {
-                        pick = Some(slot);
-                    }
-                });
-            });
+            ui.strong(slot.label()).on_hover_text(slot.tooltip());
 
             let label = state.label();
             match &state {
@@ -564,6 +545,26 @@ impl PhaseVisualizerApp {
                     ui.colored_label(ui.visuals().warn_fg_color, &label);
                 }
             }
+
+            // The buttons take a line of their own: a slot's fallback names
+            // whatever it falls back to, and some of those are long.
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button("Open…")
+                    .on_hover_text(format!("Open a .{} file", slot.extension()))
+                    .clicked()
+                {
+                    pick = Some(slot);
+                }
+                if state.is_supplied()
+                    && ui
+                        .small_button(slot.fallback_label())
+                        .on_hover_text(slot.fallback_tooltip())
+                        .clicked()
+                {
+                    revert = Some(slot);
+                }
+            });
         }
 
         if let Some(slot) = revert {
@@ -810,7 +811,7 @@ impl eframe::App for PhaseVisualizerApp {
         // The inputs live on the left, apart from the display controls on the
         // right: one panel is about what is being shown, the other about how.
         egui::Panel::left("data_sources")
-            .default_size(260.0)
+            .default_size(280.0)
             .show(ui, |ui| self.sources_panel(ui));
 
         let zoom = egui::Panel::right("sidebar")
@@ -1282,6 +1283,31 @@ mod tests {
 
     /// Every slot must describe itself, whatever state it is in — a blank line
     /// in the sidebar would be worse than no sidebar.
+    /// Each row's revert button names what it falls back to, and "synthetic"
+    /// means something different in each — an algorithm for the candidate, a
+    /// derivation for the wrapped phase, a generated field for the original.
+    #[test]
+    fn the_candidate_falls_back_to_a_named_algorithm() {
+        assert_eq!(
+            Slot::Unwrapped.fallback_label(),
+            "Use naive unwrapping algorithm",
+            "the candidate's fallback is an algorithm, so the button says which"
+        );
+        for slot in [Slot::Original, Slot::Wrapped, Slot::Path] {
+            assert_eq!(
+                slot.fallback_label(),
+                "Use synthetic",
+                "{slot:?} falls back to something the viewer supplies itself"
+            );
+        }
+        for slot in Slot::ALL {
+            assert!(
+                !slot.fallback_tooltip().is_empty(),
+                "{slot:?} must explain what giving up its file costs"
+            );
+        }
+    }
+
     #[test]
     fn every_slot_always_has_something_to_say() {
         let mut app = app();
