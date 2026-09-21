@@ -11,6 +11,7 @@
 //! aliases. Fixing that properly needs a mip pyramid or a min/max reduction
 //! pass; it is deliberately out of scope for this first slice.
 
+use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
 use eframe::egui_wgpu::{CallbackResources, CallbackTrait, RenderState, ScreenDescriptor};
@@ -19,7 +20,7 @@ use egui::Rect;
 
 use crate::colormap::Colormap;
 use crate::graph::Unwrapping;
-use crate::phase::PhaseField;
+use crate::phase::{self, PhaseField};
 
 /// Number of entries in the colormap lookup texture.
 pub const LUT_LEN: usize = 256;
@@ -112,6 +113,37 @@ impl Default for OverlayOptions {
     }
 }
 
+/// The `(offset, reciprocal span)` a linear colour mapping multiplies by.
+///
+/// A degenerate range would divide by zero, so it maps the whole field to the
+/// middle of the colormap instead — which is what a constant field means.
+fn linear_mapping(value_range: (f32, f32)) -> (f32, f32) {
+    let (min, max) = value_range;
+    if max > min && (max - min).is_finite() {
+        (min, 1.0 / (max - min))
+    } else {
+        (min - 0.5, 1.0)
+    }
+}
+
+/// Where a sample sits in the colormap, in `[0, 1]`.
+///
+/// This is the Rust twin of the two branches `grid.wgsl` takes, and exists so
+/// there is exactly one answer to the question. The node view draws with egui
+/// rather than the shader, and when it worked the mapping out for itself it
+/// got a different one: it skipped the wrap, so in wrapped mode it spread a
+/// field spanning many turns across the colormap instead of colouring each
+/// sample by its phase.
+pub fn colormap_position(value: f32, wrapped: bool, value_range: (f32, f32)) -> f32 {
+    let t = if wrapped {
+        (phase::wrap(value) + PI) / TAU
+    } else {
+        let (offset, reciprocal_span) = linear_mapping(value_range);
+        (value - offset) * reciprocal_span
+    };
+    t.clamp(0.0, 1.0)
+}
+
 /// The uniform block handed to `grid.wgsl`.
 ///
 /// Encoded as four `vec4<f32>`, matching `struct Uniforms` there. Grouping
@@ -170,14 +202,7 @@ impl GridUniforms {
         wrapped: bool,
         overlay: Option<OverlayOptions>,
     ) -> Self {
-        let (min, max) = value_range;
-        // A degenerate range would divide by zero; map the whole field to the
-        // middle of the colormap instead, which is what a constant field means.
-        let (value_min, value_range_inv) = if max > min && (max - min).is_finite() {
-            (min, 1.0 / (max - min))
-        } else {
-            (min - 0.5, 1.0)
-        };
+        let (value_min, value_range_inv) = linear_mapping(value_range);
 
         Self {
             data_min: [visible.min.x, visible.min.y],
@@ -1027,6 +1052,64 @@ mod tests {
                 0.0,
             ],
             "field order must match `struct Uniforms` in grid.wgsl"
+        );
+    }
+
+    /// The two branches the shader takes, pinned on the Rust side so the node
+    /// view cannot drift from them again.
+    #[test]
+    fn colormap_position_mirrors_the_shaders_two_branches() {
+        // Wrapped: one turn spans the colormap, and the range is irrelevant.
+        for range in [(0.0, 1.0), (-100.0, 100.0), (5.0, 5.0)] {
+            assert!(
+                (colormap_position(-PI + 1e-4, true, range) - 0.0).abs() < 1e-4,
+                "just inside the interval sits at the start"
+            );
+            assert!(
+                (colormap_position(0.0, true, range) - 0.5).abs() < 1e-5,
+                "zero phase sits in the middle"
+            );
+            assert!(
+                (colormap_position(PI, true, range) - 1.0).abs() < 1e-5,
+                "π sits at the end"
+            );
+            // The interval is closed on the right, so -π wraps to +π and lands
+            // at the far end. Harmless: the colormap is cyclic there, which is
+            // exactly why wrapped mode uses a cyclic one.
+            assert!(
+                (colormap_position(-PI, true, range) - 1.0).abs() < 1e-5,
+                "-π ≡ π, so it lands at the end rather than the start"
+            );
+            assert!(
+                (colormap_position(TAU + 0.3, true, range) - colormap_position(0.3, true, range))
+                    .abs()
+                    < 1e-5,
+                "and whole turns make no difference"
+            );
+        }
+
+        // Unbounded: a linear map over the supplied range, clamped.
+        assert!(
+            (colormap_position(2.0, false, (2.0, 6.0)) - 0.0).abs() < 1e-6,
+            "min"
+        );
+        assert!(
+            (colormap_position(4.0, false, (2.0, 6.0)) - 0.5).abs() < 1e-6,
+            "midpoint"
+        );
+        assert!(
+            (colormap_position(6.0, false, (2.0, 6.0)) - 1.0).abs() < 1e-6,
+            "max"
+        );
+        assert_eq!(
+            colormap_position(-50.0, false, (2.0, 6.0)),
+            0.0,
+            "below the range clamps rather than running off the table"
+        );
+        assert_eq!(
+            colormap_position(50.0, false, (2.0, 6.0)),
+            1.0,
+            "and above it"
         );
     }
 

@@ -311,13 +311,19 @@ impl PhaseVisualizerApp {
             Tab::Wrapped => (&scene.scene.wrapped, scene.wrapped_range),
             Tab::Unwrapped => (&scene.scene.unwrapped, scene.unwrapped_range),
         };
-        // Wrapped mode always spans a full turn, whatever the data's own range.
-        let range = if self.mode.is_wrapped() {
+        Some((field, self.effective_range(range)))
+    }
+
+    /// The values at the two ends of the colormap, for the current mode.
+    ///
+    /// Wrapped mode always spans exactly one turn, whatever the data's own
+    /// range — both views ask this, so neither can answer it differently.
+    fn effective_range(&self, range: (f32, f32)) -> (f32, f32) {
+        if self.mode.is_wrapped() {
             (-PI, PI)
         } else {
             range
-        };
-        Some((field, range))
+        }
     }
 
     /// The overlay to draw, if the unwrapped tab is showing the cell view.
@@ -681,7 +687,7 @@ impl PhaseVisualizerApp {
 
         if self.tab == Tab::Unwrapped && self.representation == Representation::Node {
             let unwrapping = Arc::clone(&scene.scene.unwrapping);
-            let range = scene.unwrapped_range;
+            let range = self.effective_range(scene.unwrapped_range);
             let (rect, response) = interact(
                 ui,
                 unwrapping.rows(),
@@ -695,7 +701,7 @@ impl PhaseVisualizerApp {
 
             self.hover = hover_at(&view, unwrapping.unwrapped(), &response, rect);
 
-            let drawn = node_view::show(ui, rect, &view, &unwrapping, self.mode.colormap(), range);
+            let drawn = node_view::show(ui, rect, &view, &unwrapping, self.mode, range);
             if !drawn && let Some(hint) = node_view::zoom_hint(view.points_per_cell()) {
                 ui.painter().text(
                     rect.center(),

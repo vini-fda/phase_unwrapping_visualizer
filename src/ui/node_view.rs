@@ -14,7 +14,7 @@
 
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Ui, pos2, vec2};
 
-use crate::colormap::Colormap;
+use crate::colormap::DisplayMode;
 use crate::graph::{EdgeState, Traversal, Unwrapping};
 use crate::view::ViewTransform;
 
@@ -44,7 +44,7 @@ pub fn show(
     rect: Rect,
     view: &ViewTransform,
     unwrapping: &Unwrapping,
-    colormap: Colormap,
+    mode: DisplayMode,
     value_range: (f32, f32),
 ) -> bool {
     if view.points_per_cell() < MIN_POINTS_PER_CELL {
@@ -145,7 +145,7 @@ pub fn show(
             painter.circle(
                 center,
                 node_radius,
-                node_color(colormap, value, value_range),
+                node_color(mode, value, value_range),
                 Stroke::new(1.0, visuals.window_stroke.color),
             );
             if label {
@@ -179,15 +179,15 @@ pub fn zoom_hint(points_per_cell: f32) -> Option<String> {
     })
 }
 
-/// The colour a node carries, from the same colormap the cell view uses.
-fn node_color(colormap: Colormap, value: f32, value_range: (f32, f32)) -> Color32 {
-    let (min, max) = value_range;
-    let t = if max > min {
-        (value - min) / (max - min)
-    } else {
-        0.5
-    };
-    let [r, g, b] = colormap.sample(t.clamp(0.0, 1.0));
+/// The colour a node carries.
+///
+/// Both the colormap and the position along it come from the display mode, so
+/// a node is coloured exactly as the cell view would colour the same sample —
+/// wrapped first when the mode says so, rather than stretched across the
+/// field's whole unbounded range.
+fn node_color(mode: DisplayMode, value: f32, value_range: (f32, f32)) -> Color32 {
+    let t = crate::render::colormap_position(value, mode.is_wrapped(), value_range);
+    let [r, g, b] = mode.colormap().sample(t);
     Color32::from_rgb(to_byte(r), to_byte(g), to_byte(b))
 }
 
@@ -352,6 +352,56 @@ mod tests {
                 (residue.to_vec2() - mean).length() < 1e-3,
                 "residue ({row}, {col}) must sit at the centre of its four pixels"
             );
+        }
+    }
+
+    /// The bug this fixes: the node view coloured by the raw value, so in
+    /// wrapped mode a field spanning many turns was smeared across the
+    /// colormap instead of being wrapped first. Two samples a whole turn apart
+    /// are the same phase and must look it.
+    #[test]
+    fn wrapped_mode_colours_a_node_by_its_phase_not_its_value() {
+        use std::f32::consts::TAU;
+        // A range like a real unwrapped field's: many turns wide.
+        let range = (0.0, 30.0);
+
+        for value in [0.3, 2.0, 5.5] {
+            assert_eq!(
+                node_color(DisplayMode::Wrapped, value, range),
+                node_color(DisplayMode::Wrapped, value + TAU, range),
+                "{value} and {value} + 2π are the same wrapped phase"
+            );
+            assert_eq!(
+                node_color(DisplayMode::Wrapped, value, range),
+                node_color(DisplayMode::Wrapped, value + 3.0 * TAU, range),
+                "however many turns apart"
+            );
+        }
+
+        // The unbounded mode must keep telling them apart, or it would be
+        // showing the wrapped field under a different name.
+        assert_ne!(
+            node_color(DisplayMode::Unbounded, 2.0, range),
+            node_color(DisplayMode::Unbounded, 2.0 + TAU, range),
+            "unbounded mode reads the value itself"
+        );
+    }
+
+    /// A node and the cell under it are the same sample, so they must be the
+    /// same colour — the two views take entirely different paths to it.
+    #[test]
+    fn a_node_is_coloured_exactly_as_its_cell_would_be() {
+        let range = (-4.0, 19.0);
+        for mode in [DisplayMode::Unbounded, DisplayMode::Wrapped] {
+            for value in [-4.0, 0.0, 1.5, 7.25, 19.0, 100.0] {
+                let shader_t = crate::render::colormap_position(value, mode.is_wrapped(), range);
+                let [r, g, b] = mode.colormap().sample(shader_t);
+                assert_eq!(
+                    node_color(mode, value, range),
+                    Color32::from_rgb(to_byte(r), to_byte(g), to_byte(b)),
+                    "{mode:?} at {value} must match what the shader computes"
+                );
+            }
         }
     }
 
