@@ -404,10 +404,6 @@ impl PhaseVisualizerApp {
 
             ui.add_space(12.0);
             ui.separator();
-            self.sources_section(ui);
-
-            ui.add_space(12.0);
-            ui.separator();
             ui.add_space(4.0);
             ui.label("Under cursor");
             match self.hover {
@@ -517,14 +513,19 @@ impl PhaseVisualizerApp {
     /// Every row says where its data came from, or — when nothing was supplied
     /// — what is being done instead and what that costs, so the display is
     /// never quietly standing on something the user did not choose.
-    fn sources_section(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.label("Data sources")
-            .on_hover_text("Where each input came from. Only the wrapped phase is required.");
+    fn sources_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| self.sources_contents(ui));
+    }
+
+    fn sources_contents(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Data sources")
+            .on_hover_text("Where each input comes from. Only the wrapped phase is required.");
         ui.add_space(2.0);
+        ui.weak("Open a file for any of these, or let the viewer supply it.");
+        ui.add_space(6.0);
 
         let mut pick = None;
-        let mut clear = None;
+        let mut revert = None;
 
         for slot in Slot::ALL {
             let state = self.inputs.state(slot);
@@ -535,11 +536,11 @@ impl PhaseVisualizerApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if state.is_supplied()
                         && ui
-                            .small_button("✕")
-                            .on_hover_text("Forget this file")
+                            .small_button("Use synthetic")
+                            .on_hover_text(slot.fallback_tooltip())
                             .clicked()
                     {
-                        clear = Some(slot);
+                        revert = Some(slot);
                     }
                     if ui
                         .small_button("Open…")
@@ -565,9 +566,8 @@ impl PhaseVisualizerApp {
             }
         }
 
-        if let Some(slot) = clear {
-            self.inputs.clear(slot);
-            self.resolve();
+        if let Some(slot) = revert {
+            self.use_synthetic(slot);
         }
         if let Some(slot) = pick {
             self.dialog.pick(slot);
@@ -583,9 +583,37 @@ impl PhaseVisualizerApp {
         if self.inputs.state(Slot::Original)
             == crate::inputs::SlotState::Supplied(Origin::Generated)
         {
-            ui.add_space(10.0);
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(4.0);
             self.generator_section(ui);
         }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
+        if ui
+            .button("Reset every input")
+            .on_hover_text("Discard all opened files and go back to the synthetic scene")
+            .clicked()
+        {
+            self.use_generated_data();
+        }
+    }
+
+    /// Stops using the file supplied for `slot`, falling back to what the
+    /// viewer can supply itself.
+    ///
+    /// For the original phase that means generating one again rather than
+    /// leaving none: dropping it outright would take a derived wrapped phase
+    /// with it and leave nothing to show at all.
+    fn use_synthetic(&mut self, slot: Slot) {
+        if slot == Slot::Original {
+            self.inputs.original = Inputs::generated(self.settings).original;
+        } else {
+            self.inputs.clear(slot);
+        }
+        self.resolve();
     }
 
     /// The knobs behind the synthetic original phase.
@@ -778,6 +806,12 @@ impl eframe::App for PhaseVisualizerApp {
             self.tab_bar(ui);
             ui.add_space(2.0);
         });
+
+        // The inputs live on the left, apart from the display controls on the
+        // right: one panel is about what is being shown, the other about how.
+        egui::Panel::left("data_sources")
+            .default_size(260.0)
+            .show(ui, |ui| self.sources_panel(ui));
 
         let zoom = egui::Panel::right("sidebar")
             .default_size(250.0)
@@ -1156,6 +1190,72 @@ mod tests {
         assert!(
             Arc::ptr_eq(&before, &field_of(&app)),
             "clearing the offending file restores what was on screen"
+        );
+    }
+
+    /// Giving up a supplied original must generate one again rather than leave
+    /// none. Dropping it outright takes a derived wrapped phase with it, and
+    /// the viewer is left with nothing to show — which is what the button used
+    /// to do.
+    #[test]
+    fn giving_up_the_original_falls_back_to_synthetic_not_to_nothing() {
+        let mut app = app();
+        app.load_example();
+        app.poll_incoming_file(&egui::Context::default());
+        assert!(app.scene.is_some(), "the example loaded");
+
+        app.use_synthetic(Slot::Original);
+
+        assert!(
+            app.error.is_none(),
+            "there must still be a scene: {:?}",
+            app.error
+        );
+        assert_eq!(
+            app.inputs.state(Slot::Original),
+            crate::inputs::SlotState::Supplied(Origin::Generated),
+            "the original comes from the generator again"
+        );
+        app.tab = Tab::Truth;
+        assert!(
+            app.displayed().is_some(),
+            "and the Truth tab still has something to show"
+        );
+    }
+
+    /// The other three slots do simply fall back, because each has something
+    /// the viewer can work out for itself.
+    #[test]
+    fn giving_up_the_other_slots_falls_back_to_what_is_derivable() {
+        let mut app = app();
+        let (rows, cols) = (app.settings.rows, app.settings.cols);
+
+        app.inputs.wrapped = Some(Supplied {
+            value: Arc::new(PhaseField::linear_gradient(rows, cols, 1.0, 1.0)),
+            origin: Origin::File("psi.phase".to_owned()),
+        });
+        app.use_synthetic(Slot::Wrapped);
+        assert_eq!(
+            app.inputs.state(Slot::Wrapped),
+            crate::inputs::SlotState::Derived("derived: ψ = wrap(original)".to_owned()),
+            "the wrapped phase goes back to being derived"
+        );
+
+        app.inputs.unwrapped = Some(Supplied {
+            value: Arc::new(PhaseField::linear_gradient(rows, cols, 1.0, 1.0)),
+            origin: Origin::File("phi.phase".to_owned()),
+        });
+        app.use_synthetic(Slot::Unwrapped);
+        assert_eq!(
+            app.inputs.state(Slot::Unwrapped),
+            crate::inputs::SlotState::Derived("integrated here along a comb path".to_owned()),
+            "the candidate goes back to being integrated here"
+        );
+        assert!(
+            app.scene
+                .as_ref()
+                .is_some_and(|scene| scene.scene.unwrapping.has_path()),
+            "and the viewer's own path is known again, so walls and arrows come back"
         );
     }
 

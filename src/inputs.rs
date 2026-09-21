@@ -111,6 +111,29 @@ impl Slot {
         }
     }
 
+    /// What happens to this slot when its file is given up.
+    pub fn fallback_tooltip(self) -> &'static str {
+        match self {
+            Self::Original => {
+                "Stop using this file and generate a synthetic original phase again.\n\n\
+                 Not simply dropped: with no original at all, a derived wrapped phase would \
+                 go with it and leave nothing to show."
+            }
+            Self::Wrapped => {
+                "Stop using this file. The wrapped phase goes back to being derived from the \
+                 original as ψ = wrap(original)."
+            }
+            Self::Unwrapped => {
+                "Stop using this file. The viewer goes back to integrating ψ itself, along a \
+                 comb path — and its own path is then known, so the walls and arrows come back."
+            }
+            Self::Path => {
+                "Stop using this file. With a supplied unwrapped phase and no path, the walls \
+                 and arrows cannot say what the walk did."
+            }
+        }
+    }
+
     /// The file extension this slot reads.
     pub fn extension(self) -> &'static str {
         match self {
