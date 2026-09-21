@@ -534,10 +534,46 @@ impl PhaseVisualizerApp {
             ui.strong(slot.label()).on_hover_text(slot.tooltip());
 
             let label = state.label();
+
+            // The two ways to fill a slot exclude each other, so they are one
+            // choice rather than two buttons: the box says which is in force,
+            // and picking the other switches to it.
+            let supplied = state.is_supplied();
+            egui::ComboBox::from_id_salt(slot.label())
+                .selected_text(if supplied {
+                    label.clone()
+                } else {
+                    slot.fallback_label().to_owned()
+                })
+                .width(ui.available_width())
+                .truncate()
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(!supplied, slot.fallback_label())
+                        .on_hover_text(slot.fallback_tooltip())
+                        .clicked()
+                        && supplied
+                    {
+                        revert = Some(slot);
+                    }
+                    // Always offers to open: choosing it while a file is
+                    // already in force is how that file gets swapped.
+                    if ui
+                        .selectable_label(supplied, format!("Open .{} file…", slot.extension()))
+                        .on_hover_text(slot.tooltip())
+                        .clicked()
+                    {
+                        pick = Some(slot);
+                    }
+                })
+                .response
+                .on_hover_text(&label);
+
+            // A supplied file is already named in the box above, so only the
+            // other two states have anything left to add — and one of them is
+            // a warning, which a file name would never be.
             match &state {
-                crate::inputs::SlotState::Supplied(_) => {
-                    ui.monospace(&label).on_hover_text(&label);
-                }
+                crate::inputs::SlotState::Supplied(_) => {}
                 crate::inputs::SlotState::Derived(_) => {
                     ui.weak(&label);
                 }
@@ -545,26 +581,6 @@ impl PhaseVisualizerApp {
                     ui.colored_label(ui.visuals().warn_fg_color, &label);
                 }
             }
-
-            // The buttons take a line of their own: a slot's fallback names
-            // whatever it falls back to, and some of those are long.
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .small_button("Open…")
-                    .on_hover_text(format!("Open a .{} file", slot.extension()))
-                    .clicked()
-                {
-                    pick = Some(slot);
-                }
-                if state.is_supplied()
-                    && ui
-                        .small_button(slot.fallback_label())
-                        .on_hover_text(slot.fallback_tooltip())
-                        .clicked()
-                {
-                    revert = Some(slot);
-                }
-            });
         }
 
         if let Some(slot) = revert {
