@@ -2,12 +2,18 @@
 //!
 //! # Layout
 //!
-//! | offset | size | meaning                                  |
-//! |--------|------|------------------------------------------|
-//! | 0      | 4    | `m`, the number of rows, as `u32`        |
-//! | 4      | 4    | `n`, the number of columns, as `u32`     |
-//! | 8      | 56   | reserved, written as zero, ignored on read |
-//! | 64     | 4mn  | the samples, row-major                   |
+//! | offset | size | meaning                                     |
+//! |--------|------|---------------------------------------------|
+//! | 0      | 4    | `m`, the number of rows, as `u32`           |
+//! | 4      | 4    | `n`, the number of columns, as `u32`        |
+//! | 8      | 1    | payload kind: `0` phase samples, `1` parent directions |
+//! | 9      | 55   | reserved, written as zero, ignored on read  |
+//! | 64     | …    | the payload, row-major                      |
+//!
+//! The payload is `4mn` bytes of `f32` for [`Kind::Phase`], and `mn` bytes of
+//! [`ParentDirection`] codes for [`Kind::Parents`]. The kind byte lives in what
+//! used to be reserved space and is zero in every file written before it
+//! existed, which is exactly why zero means "phase samples".
 //!
 //! Everything is **native-endian**, which keeps reading free on the machine
 //! that wrote the file but means a file does not survive a move between a
@@ -30,13 +36,61 @@
 
 use std::path::Path;
 
+use crate::graph::IntegrationPath;
 use crate::phase::{PhaseField, PhaseFieldError};
 
 /// Bytes of header before the samples begin.
 pub const HEADER_LEN: usize = 64;
 
-/// Conventional extension for the format.
+/// Conventional extension for a file of phase samples.
 pub const EXTENSION: &str = "phase";
+
+/// Conventional extension for a file of parent directions.
+pub const PATH_EXTENSION: &str = "path";
+
+/// What a file's payload holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `4mn` bytes: one `f32` phase sample per pixel.
+    Phase,
+    /// `mn` bytes: one [`ParentDirection`] code per pixel.
+    Parents,
+}
+
+impl Kind {
+    /// The byte this kind is stored as, at offset 8.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Phase => 0,
+            Self::Parents => 1,
+        }
+    }
+
+    /// Reads a kind from its byte.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Phase),
+            1 => Some(Self::Parents),
+            _ => None,
+        }
+    }
+
+    /// Bytes each pixel occupies in the payload.
+    fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Phase => 4,
+            Self::Parents => 1,
+        }
+    }
+
+    /// What to call it when a file turns out to hold the wrong one.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Phase => "phase samples",
+            Self::Parents => "an integration path",
+        }
+    }
+}
 
 /// The example file shipped with the crate.
 ///
@@ -47,6 +101,17 @@ pub const EXAMPLE: &[u8] = include_bytes!("../assets/original_phase_example.phas
 
 /// File name of [`EXAMPLE`].
 pub const EXAMPLE_NAME: &str = "original_phase_example.phase";
+
+/// An integration path matching [`EXAMPLE`], for trying the path slot out.
+///
+/// It is the comb walk written out explicitly, so opening it alongside a
+/// candidate reproduces exactly what the viewer would have done on its own —
+/// which makes it a way to check the file plumbing rather than a interesting
+/// path in itself.
+pub const EXAMPLE_PATH: &[u8] = include_bytes!("../assets/original_phase_example.path");
+
+/// File name of [`EXAMPLE_PATH`].
+pub const EXAMPLE_PATH_NAME: &str = "original_phase_example.path";
 
 /// Why a `.phase` file could not be read.
 #[derive(Debug)]
@@ -85,6 +150,15 @@ pub enum PhaseFileError {
     },
     /// The samples did not form a valid field.
     Field(PhaseFieldError),
+    /// The file holds a payload of a kind the caller did not ask for.
+    WrongKind {
+        /// What was being opened.
+        expected: Kind,
+        /// What the file actually holds, if it is a kind this build knows.
+        found: Option<Kind>,
+    },
+    /// The parent directions did not form a valid path.
+    Path(crate::graph::PathError),
 }
 
 impl std::fmt::Display for PhaseFileError {
@@ -114,6 +188,20 @@ impl std::fmt::Display for PhaseFileError {
                 "header says {rows} × {cols}, which needs {expected} bytes of samples, but the file has {found}"
             ),
             Self::Field(error) => write!(f, "{error}"),
+            Self::WrongKind { expected, found } => match found {
+                Some(found) => write!(
+                    f,
+                    "this file holds {}, but {} were expected",
+                    found.describe(),
+                    expected.describe()
+                ),
+                None => write!(
+                    f,
+                    "this file's payload kind is not one this version understands; {} were expected",
+                    expected.describe()
+                ),
+            },
+            Self::Path(error) => write!(f, "{error}"),
         }
     }
 }
@@ -133,28 +221,7 @@ impl From<std::io::Error> for PhaseFileError {
 /// Returns [`PhaseFileError`] if the header is missing, names an empty or
 /// unaddressable field, or disagrees with how many samples are actually there.
 pub fn decode(bytes: &[u8]) -> Result<PhaseField, PhaseFileError> {
-    let Some((header, payload)) = bytes.split_at_checked(HEADER_LEN) else {
-        return Err(PhaseFileError::TooShort { len: bytes.len() });
-    };
-
-    let rows = read_u32(header, 0);
-    let cols = read_u32(header, 4);
-    // Bytes 8..64 are reserved. They are deliberately not checked, so that a
-    // later version can use them without old readers rejecting new files.
-
-    if rows == 0 || cols == 0 {
-        return Err(PhaseFileError::Empty { rows, cols });
-    }
-
-    let expected = sample_bytes(rows, cols).ok_or(PhaseFileError::TooLarge { rows, cols })?;
-    if payload.len() != expected {
-        return Err(PhaseFileError::LengthMismatch {
-            rows,
-            cols,
-            expected,
-            found: payload.len(),
-        });
-    }
+    let (rows, cols, payload) = split(bytes, Kind::Phase)?;
 
     let data = payload
         .chunks_exact(4)
@@ -165,9 +232,61 @@ pub fn decode(bytes: &[u8]) -> Result<PhaseField, PhaseFileError> {
         })
         .collect();
 
-    // `rows` and `cols` fit in `usize` here: `sample_bytes` already proved
-    // their product does.
+    // `rows` and `cols` fit in `usize` here: `split` already proved their
+    // product does.
     PhaseField::new(data, rows as usize, cols as usize).map_err(PhaseFileError::Field)
+}
+
+/// Reads an integration path out of the bytes of a `.path` file.
+///
+/// # Errors
+///
+/// Returns [`PhaseFileError`] if the header is missing or inconsistent, if the
+/// file holds something other than parent directions, or if the directions do
+/// not describe a single walk covering every pixel.
+pub fn decode_path(bytes: &[u8]) -> Result<IntegrationPath, PhaseFileError> {
+    let (rows, cols, payload) = split(bytes, Kind::Parents)?;
+    IntegrationPath::from_codes(payload, rows as usize, cols as usize).map_err(PhaseFileError::Path)
+}
+
+/// Validates a header and hands back the dimensions and the payload.
+///
+/// This is where a header stops being trusted: `m` and `n` are `u32`, so their
+/// product can reach 2^64 and the payload size can overflow a `usize`. Both
+/// multiplications are checked, and the result then has to *match* the bytes
+/// actually present, so an impossible header is refused before anything is
+/// sized from it.
+fn split(bytes: &[u8], expected: Kind) -> Result<(u32, u32, &[u8]), PhaseFileError> {
+    let Some((header, payload)) = bytes.split_at_checked(HEADER_LEN) else {
+        return Err(PhaseFileError::TooShort { len: bytes.len() });
+    };
+
+    let rows = read_u32(header, 0);
+    let cols = read_u32(header, 4);
+
+    let found = Kind::from_code(header[8]);
+    if found != Some(expected) {
+        return Err(PhaseFileError::WrongKind { expected, found });
+    }
+    // Bytes 9..64 are reserved. They are deliberately not checked, so that a
+    // later version can use them without old readers rejecting new files.
+
+    if rows == 0 || cols == 0 {
+        return Err(PhaseFileError::Empty { rows, cols });
+    }
+
+    let wanted =
+        payload_bytes(rows, cols, expected).ok_or(PhaseFileError::TooLarge { rows, cols })?;
+    if payload.len() != wanted {
+        return Err(PhaseFileError::LengthMismatch {
+            rows,
+            cols,
+            expected: wanted,
+            found: payload.len(),
+        });
+    }
+
+    Ok((rows, cols, payload))
 }
 
 /// Writes a field out as the bytes of a `.phase` file.
@@ -184,14 +303,41 @@ pub fn encode(field: &PhaseField) -> Result<Vec<u8>, PhaseFileError> {
         });
     };
 
-    let mut bytes = Vec::with_capacity(HEADER_LEN + field.as_slice().len() * 4);
-    bytes.extend_from_slice(&rows.to_ne_bytes());
-    bytes.extend_from_slice(&cols.to_ne_bytes());
-    bytes.resize(HEADER_LEN, 0);
+    let mut bytes = header(rows, cols, Kind::Phase);
+    bytes.reserve(field.as_slice().len() * 4);
     for sample in field.as_slice() {
         bytes.extend_from_slice(&sample.to_ne_bytes());
     }
     Ok(bytes)
+}
+
+/// Writes an integration path out as the bytes of a `.path` file.
+///
+/// # Errors
+///
+/// Returns [`PhaseFileError::TooLarge`] if the path does not fit the `u32`
+/// dimensions the format allows.
+pub fn encode_path(path: &IntegrationPath) -> Result<Vec<u8>, PhaseFileError> {
+    let (Ok(rows), Ok(cols)) = (u32::try_from(path.rows()), u32::try_from(path.cols())) else {
+        return Err(PhaseFileError::TooLarge {
+            rows: u32::MAX,
+            cols: u32::MAX,
+        });
+    };
+
+    let mut bytes = header(rows, cols, Kind::Parents);
+    bytes.extend_from_slice(&path.to_codes());
+    Ok(bytes)
+}
+
+/// Builds the fixed-size header, zero-padded.
+fn header(rows: u32, cols: u32, kind: Kind) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(HEADER_LEN);
+    bytes.extend_from_slice(&rows.to_ne_bytes());
+    bytes.extend_from_slice(&cols.to_ne_bytes());
+    bytes.push(kind.code());
+    bytes.resize(HEADER_LEN, 0);
+    bytes
 }
 
 /// Reads a `.phase` file from disk.
@@ -213,15 +359,15 @@ pub fn write(path: &Path, field: &PhaseField) -> Result<(), PhaseFileError> {
     Ok(())
 }
 
-/// How many bytes of samples a `rows × cols` field needs, or `None` if that
-/// cannot be addressed here.
+/// How many bytes of payload a `rows × cols` field of `kind` needs, or `None`
+/// if that cannot be addressed here.
 ///
 /// This is the one piece of arithmetic standing between a header and an
 /// allocation, so every step of it is checked.
-fn sample_bytes(rows: u32, cols: u32) -> Option<usize> {
+fn payload_bytes(rows: u32, cols: u32, kind: Kind) -> Option<usize> {
     let rows = usize::try_from(rows).ok()?;
     let cols = usize::try_from(cols).ok()?;
-    rows.checked_mul(cols)?.checked_mul(4)
+    rows.checked_mul(cols)?.checked_mul(kind.bytes_per_pixel())
 }
 
 /// Reads a native-endian `u32` at `offset`, which must be in bounds.
@@ -255,7 +401,7 @@ mod tests {
         assert_eq!(read_u32(&bytes, 0), 3, "rows come first");
         assert_eq!(read_u32(&bytes, 4), 5, "then columns");
         assert!(
-            bytes[8..HEADER_LEN].iter().all(|byte| *byte == 0),
+            bytes[9..HEADER_LEN].iter().all(|byte| *byte == 0),
             "the reserved span must be written as zero"
         );
         assert_eq!(
@@ -270,7 +416,7 @@ mod tests {
     #[test]
     fn reserved_header_bytes_are_ignored_rather_than_rejected() {
         let mut bytes = encode(&field()).expect("3 × 5 fits in u32");
-        for byte in &mut bytes[8..HEADER_LEN] {
+        for byte in &mut bytes[9..HEADER_LEN] {
             *byte = 0xAB;
         }
         let decoded = decode(&bytes).expect("a future header field must not break today's reader");
@@ -380,17 +526,68 @@ mod tests {
         );
     }
 
+    /// The two example files are generated by a separate implementation of the
+    /// spec, so this checks that implementation and this one agree — including
+    /// about the kind byte, which is the only thing telling them apart.
     #[test]
-    fn sample_bytes_checks_every_multiplication() {
-        assert_eq!(sample_bytes(3, 5), Some(60), "3 × 5 × 4");
-        assert_eq!(sample_bytes(1, 1), Some(4), "one sample is four bytes");
+    fn the_example_path_matches_the_example_field() {
+        let path = decode_path(EXAMPLE_PATH).expect("the shipped path must decode");
+        assert_eq!((path.rows(), path.cols()), (8, 8), "it matches the field");
+        assert_eq!(path.root(), (0, 0), "the comb starts at the first pixel");
         assert_eq!(
-            sample_bytes(u32::MAX, u32::MAX),
+            path,
+            IntegrationPath::comb(8, 8),
+            "the file spells out exactly the comb the viewer builds itself"
+        );
+
+        // Each file must be refused for the other's slot, or a mix-up would be
+        // read as garbage rather than reported.
+        assert!(
+            matches!(
+                decode(EXAMPLE_PATH),
+                Err(PhaseFileError::WrongKind {
+                    expected: Kind::Phase,
+                    found: Some(Kind::Parents)
+                })
+            ),
+            "a path opened as phase samples must be refused by name"
+        );
+        assert!(
+            matches!(
+                decode_path(EXAMPLE),
+                Err(PhaseFileError::WrongKind {
+                    expected: Kind::Parents,
+                    found: Some(Kind::Phase)
+                })
+            ),
+            "and the other way round"
+        );
+    }
+
+    #[test]
+    fn a_path_survives_a_round_trip() {
+        let original = IntegrationPath::comb(4, 6);
+        let bytes = encode_path(&original).expect("4 × 6 fits in u32");
+        assert_eq!(bytes.len(), HEADER_LEN + 4 * 6, "one byte per pixel");
+        let decoded = decode_path(&bytes).expect("what we just encoded must decode");
+        assert_eq!(decoded, original, "encoding must not change the walk");
+    }
+
+    #[test]
+    fn payload_bytes_checks_every_multiplication() {
+        assert_eq!(payload_bytes(3, 5, Kind::Phase), Some(60), "3 × 5 × 4");
+        assert_eq!(
+            payload_bytes(1, 1, Kind::Phase),
+            Some(4),
+            "one sample is four bytes"
+        );
+        assert_eq!(
+            payload_bytes(u32::MAX, u32::MAX, Kind::Phase),
             None,
             "the product of two u32s times four overflows a 64-bit usize"
         );
         assert_eq!(
-            sample_bytes(1 << 31, 1 << 31),
+            payload_bytes(1 << 31, 1 << 31, Kind::Phase),
             None,
             "so does a product that is merely enormous"
         );

@@ -4,9 +4,9 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use crate::colormap::DisplayMode;
-use crate::demo::{Scene, SceneSettings};
-use crate::file_dialog::FileDialog;
-use crate::graph::Unwrapping;
+use crate::demo::SceneSettings;
+use crate::file_dialog::{FileDialog, Payload};
+use crate::inputs::{Inputs, Origin, Resolved, Slot, Supplied};
 use crate::phase::PhaseField;
 use crate::phase_file;
 use crate::render::{GridRenderer, OverlayOptions, OverlaySource};
@@ -71,48 +71,25 @@ impl Representation {
     }
 }
 
-/// Where the field on show came from.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-enum Source {
-    /// Generated from [`SceneSettings`].
-    #[default]
-    Demo,
-    /// Read out of a `.phase` file.
-    File {
-        /// What to call it in the UI.
-        name: String,
-    },
-}
-
-/// The scene, plus everything derived from it that the viewer needs per frame.
-///
-/// The two tabs hold two *separate* `Arc`s, which is what the renderer keys its
-/// uploads on: handing it a different one is what makes it refresh the GPU.
+/// The resolved scene, plus the ranges the colormaps span.
 struct Loaded {
-    /// The phase before wrapping, shown by the truth tab.
-    truth: Arc<PhaseField>,
-    /// The observable phase ψ, already inside `(-π, π]`.
-    wrapped: Arc<PhaseField>,
-    /// The candidate unwrapping φ, shared with the render callback.
-    unwrapped: Arc<PhaseField>,
-    /// The analysis behind the overlay.
-    unwrapping: Arc<Unwrapping>,
-    truth_range: (f32, f32),
+    scene: Resolved,
+    original_range: (f32, f32),
     wrapped_range: (f32, f32),
     unwrapped_range: (f32, f32),
 }
 
 impl Loaded {
-    fn new(scene: Scene) -> Self {
-        let unwrapped = Arc::new(scene.unwrapping.unwrapped().clone());
+    fn new(scene: Resolved) -> Self {
         Self {
-            truth_range: scene.truth.finite_range().unwrap_or((0.0, 1.0)),
+            original_range: scene
+                .original
+                .as_ref()
+                .and_then(|field| field.finite_range())
+                .unwrap_or((0.0, 1.0)),
             wrapped_range: scene.wrapped.finite_range().unwrap_or((0.0, 1.0)),
-            unwrapped_range: unwrapped.finite_range().unwrap_or((0.0, 1.0)),
-            truth: Arc::new(scene.truth),
-            wrapped: Arc::new(scene.wrapped),
-            unwrapped,
-            unwrapping: Arc::new(scene.unwrapping),
+            unwrapped_range: scene.unwrapped.finite_range().unwrap_or((0.0, 1.0)),
+            scene,
         }
     }
 }
@@ -140,7 +117,7 @@ pub struct PhaseVisualizerApp {
     scene: Option<Loaded>,
 
     #[serde(skip)]
-    source: Source,
+    inputs: Inputs,
 
     #[serde(skip)]
     dialog: FileDialog,
@@ -167,13 +144,13 @@ impl Default for PhaseVisualizerApp {
             overlay_options: OverlayOptions::default(),
             view: None,
             scene: None,
-            source: Source::default(),
+            inputs: Inputs::default(),
             dialog: FileDialog::default(),
             hover: None,
             colorbar: Colorbar::default(),
             error: None,
         };
-        app.rebuild_scene();
+        app.use_generated_data();
         app
     }
 }
@@ -196,14 +173,18 @@ impl PhaseVisualizerApp {
 
         // The scene is `#[serde(skip)]`, so a restored app comes back without
         // one; build it from the settings that *were* restored.
-        app.rebuild_scene();
+        app.use_generated_data();
         app
     }
 
-    /// Regenerates the demo scene from the current settings.
-    fn rebuild_scene(&mut self) {
+    /// Rebuilds the displayed scene from whatever is currently supplied.
+    ///
+    /// Called after every change to the inputs, so what is on screen always
+    /// matches what the sidebar says it came from.
+    fn resolve(&mut self) {
         self.hover = None;
-        match Scene::new(self.settings) {
+        self.view = None;
+        match self.inputs.resolve() {
             Ok(scene) => {
                 self.scene = Some(Loaded::new(scene));
                 self.error = None;
@@ -213,42 +194,94 @@ impl PhaseVisualizerApp {
                 self.error = Some(error.to_string());
             }
         }
-        // The old view may be pointing somewhere that no longer exists.
-        self.view = None;
     }
 
-    /// Replaces the scene with one built around a field read from a file.
-    fn load_field(&mut self, name: String, field: PhaseField) {
-        self.hover = None;
-        self.view = None;
-        match Scene::from_truth(field) {
-            Ok(scene) => {
-                self.scene = Some(Loaded::new(scene));
-                self.source = Source::File { name };
-                self.error = None;
-            }
+    /// Discards every supplied file and goes back to the generator.
+    fn use_generated_data(&mut self) {
+        self.inputs = Inputs::generated(self.settings);
+        self.resolve();
+    }
+
+    /// Regenerates the synthetic original, keeping any other supplied inputs.
+    fn regenerate(&mut self) {
+        self.inputs.original = Inputs::generated(self.settings).original;
+        self.resolve();
+    }
+
+    /// Files the contents of an opened file into the slot it was opened for.
+    fn accept(&mut self, opened: crate::file_dialog::Opened) {
+        let origin = Origin::File(opened.name.clone());
+        let payload = match opened.result {
+            Ok(payload) => payload,
             Err(error) => {
-                // Keep whatever was on screen; only report why the new file
-                // could not replace it.
-                self.error = Some(format!("{name}: {error}"));
+                self.error = Some(format!("{}: {error}", opened.name));
+                return;
             }
+        };
+
+        // Keep the previous inputs in hand: if the new file does not fit the
+        // others, the viewer should say so and carry on showing what it had.
+        let previous = self.inputs.clone();
+
+        match (opened.slot, payload) {
+            (Slot::Path, Payload::Path(path)) => {
+                self.inputs.path = Some(Supplied {
+                    value: std::sync::Arc::new(path),
+                    origin,
+                });
+            }
+            (slot, Payload::Phase(field)) => {
+                let supplied = Some(Supplied {
+                    value: std::sync::Arc::new(field),
+                    origin,
+                });
+                match slot {
+                    Slot::Original => self.inputs.original = supplied,
+                    Slot::Wrapped => self.inputs.wrapped = supplied,
+                    Slot::Unwrapped => self.inputs.unwrapped = supplied,
+                    Slot::Path => unreachable!("the path slot is handled above"),
+                }
+            }
+            (slot, _) => {
+                self.error = Some(format!(
+                    "{}: that file does not hold {}",
+                    opened.name,
+                    slot.label().to_lowercase()
+                ));
+                return;
+            }
+        }
+
+        self.resolve();
+        if self.error.is_some() {
+            // The combination was rejected; put back what worked.
+            self.inputs = previous;
+            let message = self.error.clone();
+            self.resolve();
+            self.error = message.map(|message| format!("{}: {message}", opened.name));
         }
     }
 
     /// Collects a file the picker or a drag-and-drop has finished reading.
     fn poll_incoming_file(&mut self, ctx: &egui::Context) {
-        // A dropped file takes the same route as the picker, so both end up
-        // reported the same way.
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // A dropped file fills whichever slot its extension names.
             let dropped = ctx.input(|input| input.raw.dropped_files.clone());
             for file in dropped {
-                let name = file
-                    .path()
+                let path = file.path().to_path_buf();
+                let name = path
                     .file_name()
                     .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                let slot = if path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case(crate::phase_file::PATH_EXTENSION)
+                }) {
+                    Slot::Path
+                } else {
+                    Slot::Original
+                };
                 match file.bytes() {
-                    Ok(bytes) => self.dialog.accept(name, &bytes),
+                    Ok(bytes) => self.dialog.accept(slot, name, &bytes),
                     Err(error) => self.error = Some(format!("{name}: {error}")),
                 }
             }
@@ -257,32 +290,26 @@ impl PhaseVisualizerApp {
         let _ = ctx;
 
         if let Some(opened) = self.dialog.take() {
-            match opened.result {
-                Ok(field) => self.load_field(opened.name, field),
-                Err(error) => self.error = Some(format!("{}: {error}", opened.name)),
-            }
+            self.accept(opened);
         }
     }
 
-    /// Loads the example that ships with the crate.
+    /// Loads the example that ships with the crate, as the original phase.
     fn load_example(&self) {
-        self.dialog
-            .accept(phase_file::EXAMPLE_NAME.to_owned(), phase_file::EXAMPLE);
+        self.dialog.accept(
+            Slot::Original,
+            phase_file::EXAMPLE_NAME.to_owned(),
+            phase_file::EXAMPLE,
+        );
     }
 
-    /// Goes back to the generated scene.
-    fn use_demo_data(&mut self) {
-        self.source = Source::Demo;
-        self.rebuild_scene();
-    }
-
-    /// The field on show, and the values at the two ends of its colormap.
+    /// The field on show, and the values at the two ends of its colormap.    /// The field on show, and the values at the two ends of its colormap.
     fn displayed(&self) -> Option<(&Arc<PhaseField>, (f32, f32))> {
         let scene = self.scene.as_ref()?;
         let (field, range) = match self.tab {
-            Tab::Truth => (&scene.truth, scene.truth_range),
-            Tab::Wrapped => (&scene.wrapped, scene.wrapped_range),
-            Tab::Unwrapped => (&scene.unwrapped, scene.unwrapped_range),
+            Tab::Truth => (scene.scene.original.as_ref()?, scene.original_range),
+            Tab::Wrapped => (&scene.scene.wrapped, scene.wrapped_range),
+            Tab::Unwrapped => (&scene.scene.unwrapped, scene.unwrapped_range),
         };
         // Wrapped mode always spans a full turn, whatever the data's own range.
         let range = if self.mode.is_wrapped() {
@@ -298,7 +325,7 @@ impl PhaseVisualizerApp {
         let scene = self.scene.as_ref()?;
         (self.tab == Tab::Unwrapped && self.representation == Representation::Cell).then(|| {
             OverlaySource {
-                unwrapping: Arc::clone(&scene.unwrapping),
+                unwrapping: Arc::clone(&scene.scene.unwrapping),
                 options: self.overlay_options,
             }
         })
@@ -377,7 +404,7 @@ impl PhaseVisualizerApp {
 
             ui.add_space(12.0);
             ui.separator();
-            self.demo_section(ui);
+            self.sources_section(ui);
 
             ui.add_space(12.0);
             ui.separator();
@@ -403,13 +430,23 @@ impl PhaseVisualizerApp {
         let Some(scene) = self.scene.as_ref() else {
             return;
         };
-        let stats = scene.unwrapping.stats();
+        let stats = scene.scene.unwrapping.stats();
         let (rows, cols) = (self.settings.rows, self.settings.cols);
 
         ui.add_space(4.0);
         ui.label("Integration path");
-        ui.monospace(format!("tree edges   {:>7}", stats.tree_edges));
-        ui.monospace(format!("cut edges    {:>7}", stats.cut_edges));
+        if scene.scene.unwrapping.has_path() {
+            ui.monospace(format!("tree edges   {:>7}", stats.tree_edges));
+            ui.monospace(format!("cut edges    {:>7}", stats.cut_edges));
+        } else {
+            ui.colored_label(ui.visuals().warn_fg_color, "no path provided")
+                .on_hover_text(
+                    "The residues and the disagreeing edges below are still exact — they \
+                 need only ψ and φ. What is missing is which edges the walk used, so \
+                 the walls cannot separate cut edges from the path and the node view \
+                 cannot draw arrows.",
+                );
+        }
         ui.monospace(format!(
             "residues   +{:>3} −{:<3}",
             stats.positive_residues, stats.negative_residues
@@ -475,23 +512,86 @@ impl PhaseVisualizerApp {
         }
     }
 
-    /// The knobs behind the synthetic scene.
-    fn demo_section(&mut self, ui: &mut egui::Ui) {
+    /// What the viewer is currently working from, slot by slot.
+    ///
+    /// Every row says where its data came from, or — when nothing was supplied
+    /// — what is being done instead and what that costs, so the display is
+    /// never quietly standing on something the user did not choose.
+    fn sources_section(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        ui.label("Data sources")
+            .on_hover_text("Where each input came from. Only the wrapped phase is required.");
+        ui.add_space(2.0);
 
-        if let Source::File { name } = self.source.clone() {
-            ui.label("Source");
-            ui.monospace(&name).on_hover_text(&name);
-            if ui.button("Use generated data").clicked() {
-                self.use_demo_data();
+        let mut pick = None;
+        let mut clear = None;
+
+        for slot in Slot::ALL {
+            let state = self.inputs.state(slot);
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.strong(slot.label()).on_hover_text(slot.tooltip());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if state.is_supplied()
+                        && ui
+                            .small_button("✕")
+                            .on_hover_text("Forget this file")
+                            .clicked()
+                    {
+                        clear = Some(slot);
+                    }
+                    if ui
+                        .small_button("Open…")
+                        .on_hover_text(format!("Open a .{} file", slot.extension()))
+                        .clicked()
+                    {
+                        pick = Some(slot);
+                    }
+                });
+            });
+
+            let label = state.label();
+            match &state {
+                crate::inputs::SlotState::Supplied(_) => {
+                    ui.monospace(&label).on_hover_text(&label);
+                }
+                crate::inputs::SlotState::Derived(_) => {
+                    ui.weak(&label);
+                }
+                crate::inputs::SlotState::Missing(_) => {
+                    ui.colored_label(ui.visuals().warn_fg_color, &label);
+                }
             }
-            if let Some(error) = self.error.as_ref() {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-            }
-            return;
         }
 
-        ui.label("Generated data");
+        if let Some(slot) = clear {
+            self.inputs.clear(slot);
+            self.resolve();
+        }
+        if let Some(slot) = pick {
+            self.dialog.pick(slot);
+        }
+
+        if let Some(error) = self.error.as_ref() {
+            ui.add_space(6.0);
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+
+        // The generator only has anything to say while it is the one supplying
+        // the original phase.
+        if self.inputs.state(Slot::Original)
+            == crate::inputs::SlotState::Supplied(Origin::Generated)
+        {
+            ui.add_space(10.0);
+            self.generator_section(ui);
+        }
+    }
+
+    /// The knobs behind the synthetic original phase.
+    fn generator_section(&mut self, ui: &mut egui::Ui) {
+        ui.label("Generator")
+            .on_hover_text("Settings for the synthetic original phase");
 
         let mut changed = false;
         changed |= ui
@@ -518,25 +618,24 @@ impl PhaseVisualizerApp {
         });
 
         if changed {
-            self.rebuild_scene();
-        }
-
-        if let Some(error) = self.error.as_ref() {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+            self.regenerate();
         }
     }
 
-    /// Draws whichever representation is selected into the central panel.
+    /// Draws whichever representation is selected into the central panel.    /// Draws whichever representation is selected into the central panel.
     fn central(&mut self, ui: &mut egui::Ui, zoom: f32) {
         let Some(scene) = self.scene.as_ref() else {
+            let message = self.error.clone().unwrap_or_else(|| {
+                "No data. Open an original or wrapped phase from the File menu.".to_owned()
+            });
             ui.centered_and_justified(|ui| {
-                ui.weak("No scene to show");
+                ui.colored_label(ui.visuals().warn_fg_color, message);
             });
             return;
         };
 
         if self.tab == Tab::Unwrapped && self.representation == Representation::Node {
-            let unwrapping = Arc::clone(&scene.unwrapping);
+            let unwrapping = Arc::clone(&scene.scene.unwrapping);
             let range = scene.unwrapped_range;
             let (rect, response) = interact(
                 ui,
@@ -551,9 +650,8 @@ impl PhaseVisualizerApp {
 
             self.hover = hover_at(&view, unwrapping.unwrapped(), &response, rect);
 
-            if !node_view::show(ui, rect, &view, &unwrapping, self.mode.colormap(), range)
-                && let Some(hint) = node_view::zoom_hint(view.points_per_cell())
-            {
+            let drawn = node_view::show(ui, rect, &view, &unwrapping, self.mode.colormap(), range);
+            if !drawn && let Some(hint) = node_view::zoom_hint(view.points_per_cell()) {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -561,11 +659,27 @@ impl PhaseVisualizerApp {
                     egui::FontId::proportional(14.0),
                     ui.visuals().weak_text_color(),
                 );
+            } else if drawn && let Some(hint) = node_view::path_hint(&unwrapping) {
+                ui.painter().text(
+                    rect.center_bottom() - egui::vec2(0.0, 8.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    hint,
+                    egui::FontId::proportional(12.0),
+                    ui.visuals().warn_fg_color,
+                );
             }
             return;
         }
 
         let Some((field, value_range)) = self.displayed() else {
+            // The only way to get here is the truth tab with no original phase.
+            ui.centered_and_justified(|ui| {
+                ui.weak(
+                    "No original phase provided.\n\n\
+                     Open one with File → Open original phase…, or switch to the \
+                     Wrapped or Unwrapped tab.",
+                );
+            });
             return;
         };
         let field = Arc::clone(field);
@@ -618,16 +732,19 @@ impl eframe::App for PhaseVisualizerApp {
         egui::Panel::top("top_panel").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui
-                        .button("Open phase data…")
-                        .on_hover_text("Open a .phase file as the original phase")
-                        .clicked()
-                    {
-                        self.dialog.pick();
-                        ui.close();
+                    for slot in Slot::ALL {
+                        if ui
+                            .button(format!("Open {}…", slot.label().to_lowercase()))
+                            .on_hover_text(slot.tooltip())
+                            .clicked()
+                        {
+                            self.dialog.pick(slot);
+                            ui.close();
+                        }
                     }
+                    ui.separator();
                     if ui
-                        .button("Open example")
+                        .button("Open example as original phase")
                         .on_hover_text(phase_file::EXAMPLE_NAME)
                         .clicked()
                     {
@@ -635,13 +752,13 @@ impl eframe::App for PhaseVisualizerApp {
                         ui.close();
                     }
                     if ui
-                        .add_enabled(
-                            self.source != Source::Demo,
-                            egui::Button::new("Use generated data"),
+                        .button("Reset to generated data")
+                        .on_hover_text(
+                            "Discard every opened file and go back to the synthetic scene",
                         )
                         .clicked()
                     {
-                        self.use_demo_data();
+                        self.use_generated_data();
                         ui.close();
                     }
 
@@ -828,7 +945,7 @@ mod tests {
         let before = field_of(&app);
 
         app.settings.noise += 0.3;
-        app.rebuild_scene();
+        app.use_generated_data();
         let after = field_of(&app);
 
         assert!(
@@ -837,68 +954,223 @@ mod tests {
         );
     }
 
-    /// Opening a file must replace every field, not just the one on show: the
-    /// wrapped and unwrapped tabs are both derived from the original phase.
+    /// Opening an original phase must rebuild every tab, not just the one on
+    /// show: the wrapped and unwrapped fields are both derived from it.
     #[test]
-    fn opening_a_file_replaces_the_whole_scene() {
+    fn opening_an_original_phase_rebuilds_every_tab() {
         let mut app = app();
         app.tab = Tab::Truth;
         let before = field_of(&app);
 
-        let example =
-            crate::phase_file::decode(crate::phase_file::EXAMPLE).expect("the example decodes");
-        app.load_field("example.phase".to_owned(), example);
+        app.load_example();
+        app.poll_incoming_file(&egui::Context::default());
 
+        assert!(app.error.is_none(), "the shipped example must load cleanly");
         assert_eq!(
-            app.source,
-            Source::File {
-                name: "example.phase".to_owned()
-            },
-            "the sidebar must be able to say where the data came from"
+            app.inputs.state(Slot::Original),
+            crate::inputs::SlotState::Supplied(Origin::File(
+                crate::phase_file::EXAMPLE_NAME.to_owned()
+            )),
+            "the sidebar must be able to name the file"
         );
-        assert!(app.error.is_none(), "a good file reports no error");
 
         let after = field_of(&app);
         assert!(
             !Arc::ptr_eq(&before, &after),
             "the renderer must be handed a fresh allocation"
         );
-        assert_eq!(
-            (after.rows(), after.cols()),
-            (8, 8),
-            "the example is 8 × 8, not the demo's shape"
-        );
-
-        // Every tab has to follow, not just the one that happened to be open.
         for tab in Tab::ALL {
             app.tab = tab;
             let field = field_of(&app);
             assert_eq!(
                 (field.rows(), field.cols()),
                 (8, 8),
-                "{tab:?} must show the loaded field's shape"
+                "{tab:?} must follow the loaded field's shape"
             );
         }
-
         assert!(
             app.view.is_none(),
-            "a differently sized field must be re-fitted rather than keeping the old view"
+            "a differently sized field must be re-fitted"
+        );
+    }
+
+    /// The whole point of the wrapped slot: a supplied ψ is what the unwrapping
+    /// was measured against, so it must never be silently replaced by one
+    /// derived from the original.
+    #[test]
+    fn a_supplied_wrapped_phase_wins_over_a_derived_one() {
+        let mut app = app();
+
+        // A wrapped field that is deliberately *not* wrap(original).
+        let psi = PhaseField::new(
+            vec![0.25; app.settings.rows * app.settings.cols],
+            app.settings.rows,
+            app.settings.cols,
+        )
+        .expect("the right number of samples");
+        app.inputs.wrapped = Some(Supplied {
+            value: Arc::new(psi),
+            origin: Origin::File("psi.phase".to_owned()),
+        });
+        app.resolve();
+
+        assert!(app.error.is_none(), "the shapes agree, so this resolves");
+        app.tab = Tab::Wrapped;
+        let shown = field_of(&app);
+        assert!(
+            shown.as_slice().iter().all(|value| *value == 0.25),
+            "the wrapped tab must show the ψ that was supplied, not wrap(original)"
         );
     }
 
     #[test]
-    fn going_back_to_generated_data_restores_the_demo() {
+    fn without_an_original_the_truth_tab_has_nothing_to_show() {
         let mut app = app();
+        app.inputs.clear(Slot::Original);
+        // Something still has to provide ψ, or there is no scene at all.
+        app.inputs.wrapped = Some(Supplied {
+            value: Arc::new(crate::demo::wrap_field(&crate::demo::noisy_ramp(
+                8, 8, 2.0, 1.0, 0.5, 3,
+            ))),
+            origin: Origin::File("psi.phase".to_owned()),
+        });
+        app.resolve();
+
+        assert!(app.error.is_none(), "a wrapped phase alone is enough");
+        app.tab = Tab::Truth;
+        assert!(
+            app.displayed().is_none(),
+            "the truth tab must report emptiness rather than invent a field"
+        );
+        app.tab = Tab::Wrapped;
+        assert!(
+            app.displayed().is_some(),
+            "while the wrapped tab still works"
+        );
+        assert_eq!(
+            app.inputs.state(Slot::Original),
+            crate::inputs::SlotState::Missing("not provided — the Truth tab is empty".to_owned()),
+            "and the sidebar must say so"
+        );
+    }
+
+    #[test]
+    fn with_nothing_supplied_there_is_no_scene_and_the_reason_is_given() {
+        let mut app = app();
+        app.inputs = crate::inputs::Inputs::default();
+        app.resolve();
+
+        assert!(app.scene.is_none(), "there is no wrapped phase to show");
+        let error = app.error.as_ref().expect("the reason must be reported");
+        assert!(
+            error.contains("original") && error.contains("wrapped"),
+            "the message must say what would fix it, got {error:?}"
+        );
+    }
+
+    /// Supplying a candidate without a path leaves the residues and the
+    /// disagreeing edges intact, but nothing can be said about the walk.
+    #[test]
+    fn an_unwrapped_phase_without_a_path_loses_only_the_path() {
+        let mut app = app();
+        let candidate = app
+            .scene
+            .as_ref()
+            .expect("a scene is loaded")
+            .scene
+            .unwrapped
+            .as_ref()
+            .clone();
+
+        app.inputs.unwrapped = Some(Supplied {
+            value: Arc::new(candidate),
+            origin: Origin::File("phi.phase".to_owned()),
+        });
+        app.resolve();
+
+        let scene = app.scene.as_ref().expect("this resolves");
+        assert!(
+            !scene.scene.unwrapping.has_path(),
+            "no path was supplied with the candidate"
+        );
+        assert_eq!(
+            scene.scene.unwrapping.stats().tree_edges,
+            0,
+            "so there is no walk to count"
+        );
+        assert_eq!(
+            app.inputs.state(Slot::Path),
+            crate::inputs::SlotState::Missing(
+                "not provided — no walls or arrows for the path".to_owned()
+            ),
+            "and the sidebar must say what that costs"
+        );
+    }
+
+    /// Clearing the candidate must clear the walk with it: a path describes how
+    /// one particular candidate was built, and means nothing without it.
+    #[test]
+    fn clearing_the_unwrapped_phase_clears_its_path() {
+        let mut app = app();
+        let (rows, cols) = (app.settings.rows, app.settings.cols);
+        app.inputs.unwrapped = Some(Supplied {
+            value: Arc::new(PhaseField::linear_gradient(rows, cols, 1.0, 1.0)),
+            origin: Origin::File("phi.phase".to_owned()),
+        });
+        app.inputs.path = Some(Supplied {
+            value: Arc::new(crate::graph::IntegrationPath::comb(rows, cols)),
+            origin: Origin::File("phi.path".to_owned()),
+        });
+
+        app.inputs.clear(Slot::Unwrapped);
+        assert!(
+            app.inputs.path.is_none(),
+            "a path without the candidate it produced describes nothing"
+        );
+    }
+
+    #[test]
+    fn a_file_of_the_wrong_shape_is_refused_and_the_view_survives() {
+        let mut app = app();
+        let before = field_of(&app);
+
+        // The example is 8 × 8, the generated scene is not.
         let example =
             crate::phase_file::decode(crate::phase_file::EXAMPLE).expect("the example decodes");
-        app.load_field("example.phase".to_owned(), example);
+        app.inputs.unwrapped = Some(Supplied {
+            value: Arc::new(example),
+            origin: Origin::File("mismatched.phase".to_owned()),
+        });
+        app.resolve();
 
-        app.use_demo_data();
+        assert!(app.scene.is_none(), "the combination cannot be resolved");
+        let error = app.error.as_ref().expect("and the reason is reported");
+        assert!(
+            error.contains('×'),
+            "the message should name both shapes, got {error:?}"
+        );
+
+        // Put it back the way it was, as `accept` does on a rejected file.
+        app.inputs.clear(Slot::Unwrapped);
+        app.resolve();
+        assert!(
+            Arc::ptr_eq(&before, &field_of(&app)),
+            "clearing the offending file restores what was on screen"
+        );
+    }
+
+    #[test]
+    fn resetting_goes_back_to_the_generator() {
+        let mut app = app();
+        app.load_example();
+        app.poll_incoming_file(&egui::Context::default());
+
+        app.use_generated_data();
 
         assert_eq!(
-            app.source,
-            Source::Demo,
-            "the source goes back to generated"
+            app.inputs.state(Slot::Original),
+            crate::inputs::SlotState::Supplied(Origin::Generated),
+            "the original comes from the generator again"
         );
         let field = field_of(&app);
         assert_eq!(
@@ -908,41 +1180,28 @@ mod tests {
         );
     }
 
-    /// A file that cannot be read must not blank the viewer.
+    /// Every slot must describe itself, whatever state it is in — a blank line
+    /// in the sidebar would be worse than no sidebar.
     #[test]
-    fn a_failed_load_keeps_what_was_already_on_screen() {
+    fn every_slot_always_has_something_to_say() {
         let mut app = app();
-        let before = field_of(&app);
-
-        app.dialog
-            .accept("broken.phase".to_owned(), &crate::phase_file::EXAMPLE[..20]);
-        app.poll_incoming_file(&egui::Context::default());
-
-        assert!(
-            app.error.is_some(),
-            "the failure has to be reported somewhere"
-        );
-        assert_eq!(app.source, Source::Demo, "and the source must not change");
-        assert!(
-            Arc::ptr_eq(&before, &field_of(&app)),
-            "the field on screen must survive a failed open"
-        );
-    }
-
-    #[test]
-    fn the_example_can_be_opened_without_a_filesystem() {
-        let mut app = app();
-        app.load_example();
-        app.poll_incoming_file(&egui::Context::default());
-
-        assert!(app.error.is_none(), "the shipped example must load cleanly");
-        assert_eq!(
-            app.source,
-            Source::File {
-                name: crate::phase_file::EXAMPLE_NAME.to_owned()
-            },
-            "and be named after the file it came from"
-        );
+        for inputs in [
+            crate::inputs::Inputs::default(),
+            crate::inputs::Inputs::generated(app.settings),
+        ] {
+            app.inputs = inputs;
+            for slot in Slot::ALL {
+                let state = app.inputs.state(slot);
+                assert!(
+                    !state.label().is_empty(),
+                    "{slot:?} must say where its data comes from"
+                );
+                assert!(
+                    !slot.tooltip().is_empty(),
+                    "{slot:?} must explain what it is for"
+                );
+            }
+        }
     }
 
     /// The overlay belongs to the unwrapped cell view alone: the node view

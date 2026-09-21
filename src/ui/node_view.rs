@@ -163,6 +163,13 @@ pub fn show(
     true
 }
 
+/// What to say when the diagram cannot show a walk.
+pub fn path_hint(unwrapping: &Unwrapping) -> Option<&'static str> {
+    (!unwrapping.has_path()).then_some(
+        "No integration path provided — edges are drawn plain, with no arrows.          Open one with File → Open integration path…",
+    )
+}
+
 /// Where the diagram stops being legible, for the caller's hint.
 pub fn zoom_hint(points_per_cell: f32) -> Option<String> {
     (points_per_cell < MIN_POINTS_PER_CELL).then(|| {
@@ -233,24 +240,24 @@ fn draw_edge(
 
     let (color, width) = match (state.is_consistent(), state.traversal) {
         (false, _) => (HIGHLIGHT, 2.4),
-        (true, Traversal::Cut) => (cut_color, 1.0),
-        (true, Traversal::Forward | Traversal::Backward) => {
-            let color = if state.traversal == Traversal::Backward {
-                BACKWARD
-            } else {
-                forward_color
-            };
-            (color, 1.6)
-        }
+        // No integration path was supplied, so nothing is known about this
+        // edge's role: it is drawn plainly rather than guessed at.
+        (true, None) => (cut_color, 1.2),
+        (true, Some(Traversal::Cut)) => (cut_color, 1.0),
+        (true, Some(Traversal::Backward)) => (BACKWARD, 1.6),
+        (true, Some(Traversal::Forward)) => (forward_color, 1.6),
     };
     let stroke = Stroke::new(width, color);
 
     match state.traversal {
-        Traversal::Cut => dotted(painter, from, to, stroke),
+        None => {
+            painter.line_segment([from, to], stroke);
+        }
+        Some(Traversal::Cut) => dotted(painter, from, to, stroke),
         // The walk enters the target, so the head goes there for a forward edge
         // and at the source for a backward one.
-        Traversal::Forward => arrow(painter, from, to, stroke, scale),
-        Traversal::Backward => arrow(painter, to, from, stroke, scale),
+        Some(Traversal::Forward) => arrow(painter, from, to, stroke, scale),
+        Some(Traversal::Backward) => arrow(painter, to, from, stroke, scale),
     }
 }
 

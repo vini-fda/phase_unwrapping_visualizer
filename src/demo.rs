@@ -8,7 +8,7 @@
 
 use std::f32::consts::TAU;
 
-use crate::graph::{Axis, EdgeId, Unwrapping, UnwrappingError};
+use crate::graph::{Axis, EdgeId, IntegrationPath, Unwrapping, UnwrappingError};
 use crate::phase::{self, PhaseField};
 
 /// A small deterministic generator, so a given seed always paints the same
@@ -85,83 +85,77 @@ pub fn wrap_field(field: &PhaseField) -> PhaseField {
     PhaseField::new(data, field.rows(), field.cols()).expect("wrapping preserves the shape")
 }
 
-/// The comb spanning tree: down column 0, then across every row.
-///
-/// This is the classic raster integration path, and a spanning tree for any
-/// `m × n` — it has `(m-1) + m(n-1) = mn - 1` edges and reaches every pixel.
-pub fn comb_tree(rows: usize, cols: usize) -> Vec<EdgeId> {
-    let mut tree = Vec::with_capacity((rows * cols).saturating_sub(1));
-    for row in 0..rows.saturating_sub(1) {
-        tree.push(EdgeId::vertical(row, 0));
-    }
-    for row in 0..rows {
-        for col in 0..cols.saturating_sub(1) {
-            tree.push(EdgeId::horizontal(row, col));
-        }
-    }
-    tree
-}
-
-/// Integrates `wrapped` along `tree`, seeded at pixel `(0, 0)`.
+/// Integrates `wrapped` along `path`, seeded at the path's root.
 ///
 /// Every step adds the wrapped difference across one edge, which is exactly
-/// what makes each tree edge consistent by construction — and leaves the cut
-/// edges free to disagree wherever a residue is enclosed.
+/// what makes each edge of the path consistent by construction — and leaves the
+/// cut edges free to disagree wherever a residue is enclosed.
+///
+/// The parent array does the work an adjacency list used to: each pixel names
+/// the one it was reached from, so the walk is a chain to follow rather than a
+/// graph to search.
 ///
 /// # Errors
 ///
-/// Returns [`UnwrappingError`] if `tree` is not a spanning tree of the field.
-pub fn integrate(wrapped: &PhaseField, tree: &[EdgeId]) -> Result<PhaseField, UnwrappingError> {
+/// Returns [`UnwrappingError`] if the field is empty or the path covers a
+/// different shape.
+pub fn integrate(
+    wrapped: &PhaseField,
+    path: &IntegrationPath,
+) -> Result<PhaseField, UnwrappingError> {
     let (rows, cols) = (wrapped.rows(), wrapped.cols());
     if rows == 0 || cols == 0 {
         return Err(UnwrappingError::Empty);
     }
-    if tree.len() != rows * cols - 1 {
-        return Err(UnwrappingError::WrongEdgeCount {
-            expected: rows * cols - 1,
-            got: tree.len(),
+    if (path.rows(), path.cols()) != (rows, cols) {
+        return Err(UnwrappingError::PathSizeMismatch {
+            field: (rows, cols),
+            path: (path.rows(), path.cols()),
         });
     }
 
-    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); rows * cols];
-    for edge in tree {
-        let ((ar, ac), (br, bc)) = edge.endpoints();
-        if br >= rows || bc >= cols {
-            return Err(UnwrappingError::EdgeOutOfBounds(*edge));
-        }
-        let (a, b) = (ar * cols + ac, br * cols + bc);
-        adjacency[a].push(b);
-        adjacency[b].push(a);
-    }
-
+    let samples = wrapped.as_slice();
     let mut phase_of = vec![f32::NAN; rows * cols];
-    let mut visited = vec![false; rows * cols];
-    let mut stack = vec![0usize];
+    let mut settled = vec![false; rows * cols];
 
-    phase_of[0] = wrapped.as_slice()[0];
-    visited[0] = true;
-    let mut reached = 1;
+    let (root_row, root_col) = path.root();
+    let root = root_row * cols + root_col;
+    phase_of[root] = samples[root];
+    settled[root] = true;
 
-    while let Some(pixel) = stack.pop() {
-        for &neighbour in &adjacency[pixel] {
-            if visited[neighbour] {
-                continue;
-            }
-            visited[neighbour] = true;
-            reached += 1;
+    // The parent of a pixel, as a flat index.
+    let parent_of = |pixel: usize| -> Option<usize> {
+        let (row, col) = (pixel / cols, pixel % cols);
+        path.parent_direction(row, col)?
+            .parent_of(row, col, rows, cols)
+            .map(|(parent_row, parent_col)| parent_row * cols + parent_col)
+    };
 
-            let from = wrapped.as_slice()[pixel];
-            let to = wrapped.as_slice()[neighbour];
-            phase_of[neighbour] = phase_of[pixel] + phase::wrap(to - from);
-            stack.push(neighbour);
+    let mut chain = Vec::new();
+    for start in 0..phase_of.len() {
+        if settled[start] {
+            continue;
         }
-    }
-
-    if reached != rows * cols {
-        return Err(UnwrappingError::NotSpanning {
-            reached,
-            total: rows * cols,
-        });
+        // Climb to something already known, remembering the way back down.
+        chain.clear();
+        let mut at = start;
+        while !settled[at] {
+            chain.push(at);
+            match parent_of(at) {
+                Some(parent) => at = parent,
+                // Unreachable: the path is validated, so only the root has no
+                // parent and the root was settled above.
+                None => break,
+            }
+        }
+        // Then walk back down, one wrapped difference at a time.
+        for &pixel in chain.iter().rev() {
+            let Some(parent) = parent_of(pixel) else {
+                continue;
+            };
+            phase_of[pixel] = phase_of[parent] + phase::wrap(samples[pixel] - samples[parent]);
+            settled[pixel] = true;
+        }
     }
 
     Ok(PhaseField::new(phase_of, rows, cols)
@@ -243,9 +237,9 @@ impl Scene {
     /// Returns [`UnwrappingError::Empty`] if the field has no samples.
     pub fn from_truth(truth: PhaseField) -> Result<Self, UnwrappingError> {
         let wrapped = wrap_field(&truth);
-        let tree = comb_tree(truth.rows(), truth.cols());
-        let candidate = integrate(&wrapped, &tree)?;
-        let unwrapping = Unwrapping::new(&wrapped, candidate, &tree)?;
+        let path = IntegrationPath::comb(truth.rows(), truth.cols());
+        let candidate = integrate(&wrapped, &path)?;
+        let unwrapping = Unwrapping::new(&wrapped, candidate, Some(path))?;
 
         Ok(Self {
             truth,
@@ -286,16 +280,16 @@ mod tests {
     #[test]
     fn the_comb_is_a_spanning_tree() {
         for (rows, cols) in [(5, 4), (1, 6), (6, 1), (2, 2), (17, 13)] {
-            let tree = comb_tree(rows, cols);
+            let path = IntegrationPath::comb(rows, cols);
             assert_eq!(
-                tree.len(),
-                rows * cols - 1,
-                "{rows}×{cols}: a spanning tree has mn - 1 edges"
+                path.root(),
+                (0, 0),
+                "{rows}×{cols}: the comb starts at the first pixel"
             );
             // `integrate` fails unless the edges really do reach every pixel.
             let field = noisy_ramp(rows, cols, 1.0, 1.0, 0.0, 1);
             assert!(
-                integrate(&wrap_field(&field), &tree).is_ok(),
+                integrate(&wrap_field(&field), &path).is_ok(),
                 "{rows}×{cols}: the comb must reach every pixel"
             );
         }
@@ -308,7 +302,8 @@ mod tests {
         let (rows, cols) = (8, 9);
         let truth = noisy_ramp(rows, cols, 0.5, 0.25, 0.0, 1);
         let wrapped = wrap_field(&truth);
-        let recovered = integrate(&wrapped, &comb_tree(rows, cols)).expect("spanning tree");
+        let recovered =
+            integrate(&wrapped, &IntegrationPath::comb(rows, cols)).expect("spanning tree");
 
         let offset = recovered.as_slice()[0] - truth.as_slice()[0];
         for (i, (&got, &want)) in recovered

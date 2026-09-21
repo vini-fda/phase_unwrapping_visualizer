@@ -21,7 +21,6 @@
 //! `(Δφ - Δψ) / 2π` on *every* edge rather than assuming it, and a non-zero
 //! result is what the viewer draws in the highlight colour.
 
-use std::collections::VecDeque;
 use std::f32::consts::TAU;
 
 use crate::phase::{self, PhaseField};
@@ -91,10 +90,13 @@ pub enum Traversal {
     Backward,
 }
 
-/// Texel code meaning "no edge here": the right edge of the last column and
-/// the bottom edge of the last row. The shader treats those positions as the
-/// outer boundary instead.
-pub const EDGE_ABSENT: u8 = 3;
+/// Texel code meaning "this wall has no role in an integration path".
+///
+/// Covers both the slots where no edge exists — the right edge of the last
+/// column, the bottom edge of the last row — and every edge when no path was
+/// supplied at all. The shader draws both the same way: a plain wall, neither
+/// dashed as part of a walk nor eligible for the cut-edge colour.
+pub const EDGE_NO_ROLE: u8 = 3;
 
 impl Traversal {
     /// `true` when the edge is part of the integration path.
@@ -115,8 +117,9 @@ impl Traversal {
 /// What the viewer knows about one edge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EdgeState {
-    /// The edge's role in the integration path.
-    pub traversal: Traversal,
+    /// The edge's role in the integration path, or `None` when no path was
+    /// supplied and there is nothing to say about it.
+    pub traversal: Option<Traversal>,
 
     /// `(Δφ - Δψ) / 2π`, rounded.
     ///
@@ -130,6 +133,358 @@ impl EdgeState {
     /// `true` when the integration delta matches the wrapped delta.
     pub fn is_consistent(self) -> bool {
         self.jump == 0
+    }
+}
+
+/// Which neighbour a pixel was reached from while the integration walked the
+/// field.
+///
+/// One byte per pixel encodes the whole integration path: which edges it used,
+/// which way it crossed each of them, and where it started. That is a great
+/// deal less than an explicit edge list — `mn` bytes against roughly `9mn` —
+/// and it is the form a breadth-first, depth-first or region-growing unwrapper
+/// already has in hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ParentDirection {
+    /// Where the integration started. Exactly one pixel carries this.
+    Root = 0,
+    /// Reached from the pixel above, `(row - 1, col)`.
+    Up = 1,
+    /// Reached from the pixel below, `(row + 1, col)`.
+    Down = 2,
+    /// Reached from the pixel to the left, `(row, col - 1)`.
+    Left = 3,
+    /// Reached from the pixel to the right, `(row, col + 1)`.
+    Right = 4,
+}
+
+impl ParentDirection {
+    /// Reads a direction from its on-disk byte.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Root),
+            1 => Some(Self::Up),
+            2 => Some(Self::Down),
+            3 => Some(Self::Left),
+            4 => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    /// The byte this direction is stored as.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The pixel this one was reached from, or `None` at the root.
+    ///
+    /// Returns `None` too when the parent would fall outside the field, which
+    /// is how an out-of-bounds direction is caught.
+    pub fn parent_of(
+        self,
+        row: usize,
+        col: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Option<(usize, usize)> {
+        let parent = match self {
+            Self::Root => return None,
+            Self::Up => (row.checked_sub(1)?, col),
+            Self::Down => (row + 1, col),
+            Self::Left => (row, col.checked_sub(1)?),
+            Self::Right => (row, col + 1),
+        };
+        (parent.0 < rows && parent.1 < cols).then_some(parent)
+    }
+
+    /// How the edge between a pixel and its parent is traversed.
+    ///
+    /// Edges are named by their upper-left endpoint, so a walk that arrived
+    /// from above or from the left ran along that naming and one that arrived
+    /// from below or the right ran against it.
+    pub fn traversal(self) -> Option<Traversal> {
+        match self {
+            Self::Root => None,
+            Self::Up | Self::Left => Some(Traversal::Forward),
+            Self::Down | Self::Right => Some(Traversal::Backward),
+        }
+    }
+}
+
+/// Why a parent array is not a valid integration path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathError {
+    /// The array does not have one entry per pixel.
+    LengthMismatch {
+        /// Rows the path claims.
+        rows: usize,
+        /// Columns the path claims.
+        cols: usize,
+        /// Entries actually supplied.
+        len: usize,
+    },
+    /// A byte outside `0..=4`.
+    BadDirection {
+        /// Row of the offending pixel.
+        row: usize,
+        /// Column of the offending pixel.
+        col: usize,
+        /// The byte that was there.
+        code: u8,
+    },
+    /// A pixel points at a parent outside the field.
+    ParentOutOfBounds {
+        /// Row of the offending pixel.
+        row: usize,
+        /// Column of the offending pixel.
+        col: usize,
+    },
+    /// The path has no root, or more than one.
+    ///
+    /// A walk starts in exactly one place; anything else describes several
+    /// disconnected walks, or none.
+    RootCount {
+        /// How many pixels claimed to be the root.
+        found: usize,
+    },
+    /// Following parents from this pixel goes round in circles instead of
+    /// reaching the root.
+    Cycle {
+        /// Row of a pixel on the cycle.
+        row: usize,
+        /// Column of a pixel on the cycle.
+        col: usize,
+    },
+}
+
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::LengthMismatch { rows, cols, len } => write!(
+                f,
+                "the path has {len} entries, but {rows} × {cols} needs {}",
+                rows * cols
+            ),
+            Self::BadDirection { row, col, code } => {
+                write!(
+                    f,
+                    "pixel ({row}, {col}) has direction byte {code}, which is not 0..=4"
+                )
+            }
+            Self::ParentOutOfBounds { row, col } => {
+                write!(
+                    f,
+                    "pixel ({row}, {col}) points at a parent outside the field"
+                )
+            }
+            Self::RootCount { found } => {
+                write!(
+                    f,
+                    "a path starts at exactly one pixel, but {found} are marked as the root"
+                )
+            }
+            Self::Cycle { row, col } => write!(
+                f,
+                "following parents from ({row}, {col}) never reaches the root"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PathError {}
+
+/// The path the integration walked, as one parent direction per pixel.
+///
+/// Validated on construction, so every pixel is guaranteed to reach the single
+/// root by following parents. That makes the used edges a spanning tree of `G`
+/// without ever having to count them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationPath {
+    parents: Vec<ParentDirection>,
+    rows: usize,
+    cols: usize,
+    root: (usize, usize),
+}
+
+impl IntegrationPath {
+    /// Validates a parent array.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] if the array is the wrong length, holds a byte
+    /// outside `0..=4`, points outside the field, has other than exactly one
+    /// root, or contains a cycle.
+    pub fn from_codes(codes: &[u8], rows: usize, cols: usize) -> Result<Self, PathError> {
+        let expected = rows.saturating_mul(cols);
+        if codes.len() != expected {
+            return Err(PathError::LengthMismatch {
+                rows,
+                cols,
+                len: codes.len(),
+            });
+        }
+
+        let mut parents = Vec::with_capacity(codes.len());
+        let mut root = None;
+        let mut roots = 0;
+        for (index, &code) in codes.iter().enumerate() {
+            let (row, col) = (index / cols.max(1), index % cols.max(1));
+            let direction = ParentDirection::from_code(code).ok_or(PathError::BadDirection {
+                row,
+                col,
+                code,
+            })?;
+            if direction == ParentDirection::Root {
+                roots += 1;
+                root = Some((row, col));
+            } else if direction.parent_of(row, col, rows, cols).is_none() {
+                return Err(PathError::ParentOutOfBounds { row, col });
+            }
+            parents.push(direction);
+        }
+
+        let Some(root) = root.filter(|_| roots == 1) else {
+            return Err(PathError::RootCount { found: roots });
+        };
+
+        let path = Self {
+            parents,
+            rows,
+            cols,
+            root,
+        };
+        path.check_reaches_root()?;
+        Ok(path)
+    }
+
+    /// Every pixel must reach the root; otherwise the "path" contains a loop
+    /// that no walk could have produced.
+    ///
+    /// Each chain is followed once and its pixels marked, so the whole check is
+    /// linear however tangled the parents are.
+    fn check_reaches_root(&self) -> Result<(), PathError> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Mark {
+            Unvisited,
+            OnCurrentChain,
+            ReachesRoot,
+        }
+
+        let mut marks = vec![Mark::Unvisited; self.parents.len()];
+        let mut chain = Vec::new();
+
+        for start in 0..self.parents.len() {
+            if marks[start] != Mark::Unvisited {
+                continue;
+            }
+            chain.clear();
+            let mut at = start;
+            loop {
+                match marks[at] {
+                    Mark::ReachesRoot => break,
+                    Mark::OnCurrentChain => {
+                        let (row, col) = (at / self.cols, at % self.cols);
+                        return Err(PathError::Cycle { row, col });
+                    }
+                    Mark::Unvisited => {}
+                }
+                marks[at] = Mark::OnCurrentChain;
+                chain.push(at);
+
+                let (row, col) = (at / self.cols, at % self.cols);
+                match self.parents[at].parent_of(row, col, self.rows, self.cols) {
+                    Some((parent_row, parent_col)) => at = parent_row * self.cols + parent_col,
+                    // Only the root has no parent, and it has been validated.
+                    None => break,
+                }
+            }
+            for &pixel in &chain {
+                marks[pixel] = Mark::ReachesRoot;
+            }
+        }
+        Ok(())
+    }
+
+    /// The comb path: down the first column, then along each row.
+    ///
+    /// This is the classic raster integration, and the viewer's fallback when
+    /// no path is supplied with an unwrapping.
+    pub fn comb(rows: usize, cols: usize) -> Self {
+        let mut parents = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                parents.push(match (row, col) {
+                    (0, 0) => ParentDirection::Root,
+                    // The first column hangs off the pixel above it, …
+                    (_, 0) => ParentDirection::Up,
+                    // … and every other pixel off the one to its left.
+                    _ => ParentDirection::Left,
+                });
+            }
+        }
+        Self {
+            parents,
+            rows,
+            cols,
+            root: (0, 0),
+        }
+    }
+
+    /// Number of rows the path covers.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Number of columns the path covers.
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Where the integration started.
+    pub fn root(&self) -> (usize, usize) {
+        self.root
+    }
+
+    /// The direction stored for one pixel.
+    pub fn parent_direction(&self, row: usize, col: usize) -> Option<ParentDirection> {
+        (row < self.rows && col < self.cols).then(|| self.parents[row * self.cols + col])
+    }
+
+    /// The bytes this path is stored as, one per pixel, row-major.
+    pub fn to_codes(&self) -> Vec<u8> {
+        self.parents.iter().map(|parent| parent.code()).collect()
+    }
+
+    /// How the integration crossed `edge`, or [`Traversal::Cut`] if it never
+    /// did.
+    ///
+    /// An edge is in the path exactly when one of its endpoints names the other
+    /// as its parent.
+    pub fn traversal(&self, edge: EdgeId) -> Traversal {
+        let ((source_row, source_col), (target_row, target_col)) = edge.endpoints();
+        if target_row >= self.rows || target_col >= self.cols {
+            return Traversal::Cut;
+        }
+
+        // The target was reached from the source: the walk ran along the edge's
+        // own naming.
+        if let Some(direction) = self.parent_direction(target_row, target_col)
+            && direction.parent_of(target_row, target_col, self.rows, self.cols)
+                == Some((source_row, source_col))
+        {
+            return Traversal::Forward;
+        }
+
+        // The source was reached from the target: the walk ran against it.
+        if let Some(direction) = self.parent_direction(source_row, source_col)
+            && direction.parent_of(source_row, source_col, self.rows, self.cols)
+                == Some((target_row, target_col))
+        {
+            return Traversal::Backward;
+        }
+
+        Traversal::Cut
     }
 }
 
@@ -147,20 +502,12 @@ pub enum UnwrappingError {
     Empty,
     /// An edge names a pixel pair that does not exist.
     EdgeOutOfBounds(EdgeId),
-    /// A spanning tree of `mn` pixels has exactly `mn - 1` edges.
-    WrongEdgeCount {
-        /// How many edges a spanning tree would need.
-        expected: usize,
-        /// How many were supplied.
-        got: usize,
-    },
-    /// The edges do not connect every pixel to the seed, so they are not a
-    /// spanning tree (they contain a cycle, or leave the graph disconnected).
-    NotSpanning {
-        /// How many pixels the walk reached.
-        reached: usize,
-        /// How many pixels there are.
-        total: usize,
+    /// The integration path does not cover the same pixels as the field.
+    PathSizeMismatch {
+        /// Dimensions of the field, as `(rows, cols)`.
+        field: (usize, usize),
+        /// Dimensions the path covers, as `(rows, cols)`.
+        path: (usize, usize),
     },
 }
 
@@ -177,12 +524,10 @@ impl std::fmt::Display for UnwrappingError {
                 let ((ar, ac), (br, bc)) = edge.endpoints();
                 write!(f, "edge ({ar}, {ac}) -> ({br}, {bc}) leaves the field")
             }
-            Self::WrongEdgeCount { expected, got } => {
-                write!(f, "a spanning tree needs {expected} edges, got {got}")
-            }
-            Self::NotSpanning { reached, total } => write!(
+            Self::PathSizeMismatch { field, path } => write!(
                 f,
-                "the integration path reaches {reached} of {total} pixels, so it is not a spanning tree"
+                "the integration path covers {} × {}, but the field is {} × {}",
+                path.0, path.1, field.0, field.1
             ),
         }
     }
@@ -216,21 +561,30 @@ pub struct Unwrapping {
     vertical: Vec<EdgeState>,
     /// Row-major, `(rows - 1) × (cols - 1)`, each in `-1..=1`.
     residues: Vec<i8>,
+    /// The walk that produced `unwrapped`, when it is known.
+    path: Option<IntegrationPath>,
     stats: UnwrappingStats,
 }
 
 impl Unwrapping {
-    /// Analyses `unwrapped` as a candidate unwrapping of `wrapped`, integrated
-    /// along `tree` starting from pixel `(0, 0)`.
+    /// Analyses `unwrapped` as a candidate unwrapping of `wrapped`.
+    ///
+    /// `path` is the walk that is claimed to have produced it. It is optional,
+    /// and its absence costs less than it might seem: the residues come from
+    /// `wrapped` alone and the disagreeing edges from the two fields together,
+    /// so everything the highlight shows survives without it. What is lost is
+    /// the cut/tree distinction between walls, the arrows in the node view, and
+    /// the edge counts — all of which are statements about a path, and cannot
+    /// be invented when none was given.
     ///
     /// # Errors
     ///
-    /// Returns [`UnwrappingError`] if the two fields disagree on size, if the
-    /// field is empty, or if `tree` is not a spanning tree of the pixel graph.
+    /// Returns [`UnwrappingError`] if the fields disagree on size, if the field
+    /// is empty, or if `path` covers a different shape.
     pub fn new(
         wrapped: &PhaseField,
         unwrapped: PhaseField,
-        tree: &[EdgeId],
+        path: Option<IntegrationPath>,
     ) -> Result<Self, UnwrappingError> {
         let (rows, cols) = (wrapped.rows(), wrapped.cols());
         if (unwrapped.rows(), unwrapped.cols()) != (rows, cols) {
@@ -242,40 +596,48 @@ impl Unwrapping {
         if rows == 0 || cols == 0 {
             return Err(UnwrappingError::Empty);
         }
+        if let Some(path) = path.as_ref()
+            && (path.rows(), path.cols()) != (rows, cols)
+        {
+            return Err(UnwrappingError::PathSizeMismatch {
+                field: (rows, cols),
+                path: (path.rows(), path.cols()),
+            });
+        }
 
         let mut horizontal = vec![EdgeState::default(); rows * cols.saturating_sub(1)];
         let mut vertical = vec![EdgeState::default(); rows.saturating_sub(1) * cols];
 
-        let traversals = walk_tree(rows, cols, tree)?;
-        for (edge, traversal) in tree.iter().zip(traversals) {
-            match edge.axis {
-                Axis::Horizontal => {
-                    horizontal[edge.row * (cols - 1) + edge.col].traversal = traversal;
-                }
-                Axis::Vertical => {
-                    vertical[edge.row * cols + edge.col].traversal = traversal;
-                }
-            }
-        }
-
         for row in 0..rows {
             for col in 0..cols.saturating_sub(1) {
-                horizontal[row * (cols - 1) + col].jump =
-                    jump(wrapped, &unwrapped, (row, col), (row, col + 1));
+                let state = &mut horizontal[row * (cols - 1) + col];
+                state.jump = jump(wrapped, &unwrapped, (row, col), (row, col + 1));
+                state.traversal = path
+                    .as_ref()
+                    .map(|path| path.traversal(EdgeId::horizontal(row, col)));
             }
         }
         for row in 0..rows.saturating_sub(1) {
             for col in 0..cols {
-                vertical[row * cols + col].jump =
-                    jump(wrapped, &unwrapped, (row, col), (row + 1, col));
+                let state = &mut vertical[row * cols + col];
+                state.jump = jump(wrapped, &unwrapped, (row, col), (row + 1, col));
+                state.traversal = path
+                    .as_ref()
+                    .map(|path| path.traversal(EdgeId::vertical(row, col)));
             }
         }
 
         let residues = residue_field(wrapped);
 
+        let tree_edges = horizontal
+            .iter()
+            .chain(&vertical)
+            .filter(|state| state.traversal.is_some_and(Traversal::is_in_tree))
+            .count();
+
         let stats = UnwrappingStats {
-            tree_edges: tree.len(),
-            cut_edges: horizontal.len() + vertical.len() - tree.len(),
+            tree_edges,
+            cut_edges: (horizontal.len() + vertical.len()) - tree_edges,
             inconsistent_edges: horizontal
                 .iter()
                 .chain(&vertical)
@@ -290,8 +652,20 @@ impl Unwrapping {
             horizontal,
             vertical,
             residues,
+            path,
             stats,
         })
+    }
+
+    /// The walk that produced the candidate, if one was supplied.
+    pub fn path(&self) -> Option<&IntegrationPath> {
+        self.path.as_ref()
+    }
+
+    /// `true` when an integration path is known, so the walls can distinguish
+    /// cut edges from the path and the node view can draw arrows.
+    pub fn has_path(&self) -> bool {
+        self.path.is_some()
     }
 
     /// The candidate unwrapped phase.
@@ -343,9 +717,9 @@ impl Unwrapping {
         for row in 0..rows {
             for col in 0..cols {
                 for state in [self.horizontal_edge(row, col), self.vertical_edge(row, col)] {
-                    let (traversal, jump) = state.map_or((EDGE_ABSENT, 0), |state| {
+                    let (traversal, jump) = state.map_or((EDGE_NO_ROLE, 0), |state| {
                         (
-                            state.traversal.code(),
+                            state.traversal.map_or(EDGE_NO_ROLE, Traversal::code),
                             u8::try_from(state.jump.unsigned_abs()).unwrap_or(u8::MAX),
                         )
                     });
@@ -375,70 +749,6 @@ impl Unwrapping {
             None
         }
     }
-}
-
-/// Walks the supplied edges from pixel `(0, 0)`, returning how each one is
-/// traversed, in the order the edges were given.
-///
-/// This doubles as the spanning-tree check: with exactly `mn - 1` edges, a walk
-/// that reaches every pixel can only have been over a tree.
-fn walk_tree(rows: usize, cols: usize, tree: &[EdgeId]) -> Result<Vec<Traversal>, UnwrappingError> {
-    let pixels = rows * cols;
-    let expected = pixels - 1;
-    if tree.len() != expected {
-        return Err(UnwrappingError::WrongEdgeCount {
-            expected,
-            got: tree.len(),
-        });
-    }
-
-    // Adjacency, carrying the index of the edge that produced each link so the
-    // walk can report the traversal of the caller's own edge list.
-    let mut adjacency: Vec<Vec<(usize, usize)>> = vec![Vec::new(); pixels];
-    for (index, edge) in tree.iter().enumerate() {
-        let ((ar, ac), (br, bc)) = edge.endpoints();
-        if br >= rows || bc >= cols {
-            return Err(UnwrappingError::EdgeOutOfBounds(*edge));
-        }
-        let (a, b) = (ar * cols + ac, br * cols + bc);
-        adjacency[a].push((b, index));
-        adjacency[b].push((a, index));
-    }
-
-    let mut traversals = vec![Traversal::Cut; tree.len()];
-    let mut visited = vec![false; pixels];
-    let mut queue = VecDeque::new();
-
-    visited[0] = true;
-    queue.push_back(0usize);
-    let mut reached = 1;
-
-    while let Some(pixel) = queue.pop_front() {
-        for &(neighbour, index) in &adjacency[pixel] {
-            if visited[neighbour] {
-                continue;
-            }
-            visited[neighbour] = true;
-            reached += 1;
-            // The walk entered `neighbour` from `pixel`; the edge is forward
-            // when `pixel` is also its canonical source.
-            let ((ar, ac), _) = tree[index].endpoints();
-            traversals[index] = if ar * cols + ac == pixel {
-                Traversal::Forward
-            } else {
-                Traversal::Backward
-            };
-            queue.push_back(neighbour);
-        }
-    }
-
-    if reached != pixels {
-        return Err(UnwrappingError::NotSpanning {
-            reached,
-            total: pixels,
-        });
-    }
-    Ok(traversals)
 }
 
 /// `(Δφ - Δψ) / 2π` on the edge from `a` to `b`, rounded.
@@ -515,10 +825,26 @@ mod tests {
 
     use super::*;
 
-    use crate::demo::{comb_tree as comb, integrate};
+    use crate::demo::integrate;
 
     fn ramp(rows: usize, cols: usize) -> PhaseField {
         PhaseField::linear_gradient(rows, cols, 1.5, 0.75)
+    }
+
+    /// Counts the edges the path actually uses.
+    fn count_tree_edges(path: &IntegrationPath, rows: usize, cols: usize) -> usize {
+        let mut count = 0;
+        for row in 0..rows {
+            for col in 0..cols {
+                if col + 1 < cols && path.traversal(EdgeId::horizontal(row, col)).is_in_tree() {
+                    count += 1;
+                }
+                if row + 1 < rows && path.traversal(EdgeId::vertical(row, col)).is_in_tree() {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     fn wrapped_of(field: &PhaseField) -> PhaseField {
@@ -529,9 +855,10 @@ mod tests {
     #[test]
     fn a_spanning_tree_has_the_edge_count_the_algebra_predicts() {
         for (rows, cols) in [(5, 4), (1, 7), (9, 1), (2, 2)] {
-            let tree = comb(rows, cols);
+            let path = IntegrationPath::comb(rows, cols);
+            let tree_edges = count_tree_edges(&path, rows, cols);
             assert_eq!(
-                tree.len(),
+                tree_edges,
                 rows * cols - 1,
                 "{rows}×{cols}: a spanning tree has mn - 1 edges"
             );
@@ -543,7 +870,7 @@ mod tests {
                 "{rows}×{cols}: e_total = 2mn - m - n"
             );
             assert_eq!(
-                total - tree.len(),
+                total - tree_edges,
                 (rows - 1) * (cols - 1),
                 "{rows}×{cols}: e_non-tree = (m-1)(n-1)"
             );
@@ -555,25 +882,34 @@ mod tests {
         let (rows, cols) = (9, 7);
         let truth = ramp(rows, cols);
         let psi = wrapped_of(&truth);
-        let tree = comb(rows, cols);
+        let path = IntegrationPath::comb(rows, cols);
 
-        let phi = integrate(&psi, &tree).expect("the comb is a spanning tree");
-        let unwrapping = Unwrapping::new(&psi, phi, &tree).expect("the comb is a spanning tree");
+        let phi = integrate(&psi, &path).expect("the comb is a spanning tree");
+        let unwrapping =
+            Unwrapping::new(&psi, phi, Some(path.clone())).expect("the comb is a spanning tree");
 
-        for edge in &tree {
-            let state = match edge.axis {
-                Axis::Horizontal => unwrapping.horizontal_edge(edge.row, edge.col),
-                Axis::Vertical => unwrapping.vertical_edge(edge.row, edge.col),
+        for row in 0..rows {
+            for col in 0..cols {
+                for edge in [EdgeId::horizontal(row, col), EdgeId::vertical(row, col)] {
+                    if !path.traversal(edge).is_in_tree() {
+                        continue;
+                    }
+                    let state = match edge.axis {
+                        Axis::Horizontal => unwrapping.horizontal_edge(edge.row, edge.col),
+                        Axis::Vertical => unwrapping.vertical_edge(edge.row, edge.col),
+                    }
+                    .expect("the edge is inside the field");
+                    assert!(
+                        state.is_consistent(),
+                        "tree edge {edge:?} must move the phase by exactly the wrapped delta"
+                    );
+                    assert_eq!(
+                        state.traversal.map(Traversal::is_in_tree),
+                        Some(true),
+                        "tree edge {edge:?} must be marked as part of the path"
+                    );
+                }
             }
-            .expect("the edge is inside the field");
-            assert!(
-                state.is_consistent(),
-                "tree edge {edge:?} must move the phase by exactly the wrapped delta"
-            );
-            assert!(
-                state.traversal.is_in_tree(),
-                "tree edge {edge:?} must be marked as part of the path"
-            );
         }
     }
 
@@ -584,10 +920,10 @@ mod tests {
         // loop can accumulate a full turn and there are no residues.
         let truth = PhaseField::linear_gradient(rows, cols, 1.0, 0.5);
         let psi = wrapped_of(&truth);
-        let tree = comb(rows, cols);
+        let path = IntegrationPath::comb(rows, cols);
 
-        let phi = integrate(&psi, &tree).expect("spanning tree");
-        let unwrapping = Unwrapping::new(&psi, phi, &tree).expect("spanning tree");
+        let phi = integrate(&psi, &path).expect("spanning tree");
+        let unwrapping = Unwrapping::new(&psi, phi, Some(path.clone())).expect("spanning tree");
         let stats = unwrapping.stats();
 
         assert_eq!(
@@ -630,9 +966,9 @@ mod tests {
         assert_eq!(residue, 1, "this loop encircles one full turn");
 
         let (rows, cols) = (2, 2);
-        let tree = comb(rows, cols);
-        let phi = integrate(&psi, &tree).expect("spanning tree");
-        let unwrapping = Unwrapping::new(&psi, phi, &tree).expect("spanning tree");
+        let path = IntegrationPath::comb(rows, cols);
+        let phi = integrate(&psi, &path).expect("spanning tree");
+        let unwrapping = Unwrapping::new(&psi, phi, Some(path.clone())).expect("spanning tree");
         let stats = unwrapping.stats();
 
         assert_eq!(stats.positive_residues, 1, "one +1 charge");
@@ -704,85 +1040,180 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_orients_every_tree_edge_away_from_the_seed() {
+    fn the_comb_walks_every_edge_along_its_own_naming() {
         let (rows, cols) = (4, 3);
-        let tree = comb(rows, cols);
-        let traversals = walk_tree(rows, cols, &tree).expect("the comb spans the grid");
+        let path = IntegrationPath::comb(rows, cols);
+        assert_eq!(path.root(), (0, 0), "the comb starts at the first pixel");
 
-        assert_eq!(traversals.len(), tree.len(), "one traversal per edge");
+        for row in 0..rows {
+            for col in 0..cols {
+                for edge in [EdgeId::horizontal(row, col), EdgeId::vertical(row, col)] {
+                    let traversal = path.traversal(edge);
+                    assert_ne!(
+                        traversal,
+                        Traversal::Backward,
+                        "the comb is built from (0,0) outwards, so nothing is walked backwards: {edge:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A walk that reaches a pixel from below or the right runs against the
+    /// edge's own naming, and has to be reported as such or the node view draws
+    /// its arrows the wrong way round.
+    #[test]
+    fn a_walk_against_the_grain_is_reported_backwards() {
+        // A 1 × 3 row rooted at its right-hand end, so the walk runs leftwards.
+        let path = IntegrationPath::from_codes(
+            &[
+                ParentDirection::Right.code(),
+                ParentDirection::Right.code(),
+                ParentDirection::Root.code(),
+            ],
+            1,
+            3,
+        )
+        .expect("a chain rooted at one end is a valid walk");
+
+        assert_eq!(path.root(), (0, 2), "the root is where it was put");
+        assert_eq!(
+            path.traversal(EdgeId::horizontal(0, 0)),
+            Traversal::Backward,
+            "reached from the right, so against the edge's naming"
+        );
+        assert_eq!(
+            path.traversal(EdgeId::horizontal(0, 1)),
+            Traversal::Backward,
+            "and so is the next one along"
+        );
+    }
+
+    #[test]
+    fn a_parent_array_must_describe_a_single_walk() {
+        // Two roots: two walks, not one.
+        assert_eq!(
+            IntegrationPath::from_codes(&[0, 0], 1, 2).expect_err("two roots"),
+            PathError::RootCount { found: 2 },
+            "a walk starts in exactly one place"
+        );
+        assert_eq!(
+            IntegrationPath::from_codes(
+                &[ParentDirection::Right.code(), ParentDirection::Left.code()],
+                1,
+                2
+            )
+            .expect_err("no root"),
+            PathError::RootCount { found: 0 },
+            "and it has to start somewhere"
+        );
+
+        // A pair pointing at each other never reaches the root.
+        let cycle = IntegrationPath::from_codes(
+            &[
+                ParentDirection::Root.code(),
+                ParentDirection::Right.code(),
+                ParentDirection::Left.code(),
+            ],
+            1,
+            3,
+        );
         assert!(
-            traversals.iter().all(|t| *t == Traversal::Forward),
-            "the comb is built from (0,0) outwards, so every edge is walked forwards"
+            matches!(cycle, Err(PathError::Cycle { .. })),
+            "a loop is not a walk, got {cycle:?}"
+        );
+
+        assert_eq!(
+            IntegrationPath::from_codes(&[0, 9], 1, 2).expect_err("9 is not a direction"),
+            PathError::BadDirection {
+                row: 0,
+                col: 1,
+                code: 9
+            },
+            "only 0..=4 name a neighbour"
+        );
+        assert_eq!(
+            IntegrationPath::from_codes(&[0, ParentDirection::Right.code()], 1, 2)
+                .expect_err("the last pixel has nothing to its right"),
+            PathError::ParentOutOfBounds { row: 0, col: 1 },
+            "a parent outside the field is not a parent"
+        );
+        assert_eq!(
+            IntegrationPath::from_codes(&[0], 2, 2).expect_err("one entry for four pixels"),
+            PathError::LengthMismatch {
+                rows: 2,
+                cols: 2,
+                len: 1
+            },
+            "there must be exactly one direction per pixel"
+        );
+    }
+
+    /// Without a path the residues and the disagreeing edges are unchanged —
+    /// they never needed one — but nothing can be said about any edge's role.
+    #[test]
+    fn an_unwrapping_without_a_path_still_measures_everything_it_can() {
+        let (rows, cols) = (12, 10);
+        let psi = wrapped_of(&crate::demo::noisy_ramp(rows, cols, 3.0, 1.5, 0.9, 11));
+        let path = IntegrationPath::comb(rows, cols);
+        let phi = integrate(&psi, &path).expect("the comb spans the grid");
+
+        let with = Unwrapping::new(&psi, phi.clone(), Some(path)).expect("valid");
+        let without = Unwrapping::new(&psi, phi, None).expect("a path is optional");
+
+        assert!(with.has_path(), "one was given");
+        assert!(!without.has_path(), "and one was not");
+
+        assert_eq!(
+            with.stats().inconsistent_edges,
+            without.stats().inconsistent_edges,
+            "the disagreeing edges come from ψ and φ alone"
+        );
+        assert_eq!(
+            (
+                with.stats().positive_residues,
+                with.stats().negative_residues
+            ),
+            (
+                without.stats().positive_residues,
+                without.stats().negative_residues
+            ),
+            "and the residues from ψ alone"
+        );
+
+        assert_eq!(
+            without.stats().tree_edges,
+            0,
+            "with no path there is no path to count"
+        );
+        assert_eq!(
+            without
+                .horizontal_edge(0, 0)
+                .expect("the edge exists")
+                .traversal,
+            None,
+            "and no edge can be said to have a role in one"
+        );
+        assert!(
+            with.stats().tree_edges > 0,
+            "whereas a supplied path does have edges"
         );
     }
 
     #[test]
-    fn a_tree_given_against_the_grain_is_walked_backwards() {
-        // A 1 × 3 row whose only spanning tree is the two horizontal edges,
-        // seeded at (0, 0): both are walked forwards.
-        let forwards = walk_tree(1, 3, &[EdgeId::horizontal(0, 0), EdgeId::horizontal(0, 1)])
-            .expect("spans the row");
-        assert_eq!(
-            forwards,
-            vec![Traversal::Forward, Traversal::Forward],
-            "walking rightwards from the seed follows the canonical orientation"
-        );
-
-        // A 3 × 1 column seeded at (0, 0) walks downwards, which is also
-        // canonical; to get a backward edge the seed must be reached from below.
-        let column = walk_tree(1, 3, &[EdgeId::horizontal(0, 1), EdgeId::horizontal(0, 0)])
-            .expect("spans the row");
-        assert_eq!(
-            column,
-            vec![Traversal::Forward, Traversal::Forward],
-            "edge order must not change how the walk orients them"
-        );
-    }
-
-    #[test]
-    fn a_non_tree_is_rejected_rather_than_half_analysed() {
+    fn a_path_of_the_wrong_shape_is_rejected() {
         let psi = wrapped_of(&ramp(3, 3));
         let phi = ramp(3, 3);
 
-        let too_few = Unwrapping::new(&psi, phi.clone(), &[EdgeId::horizontal(0, 0)])
-            .expect_err("one edge cannot span nine pixels");
+        let wrong_shape = Unwrapping::new(&psi, phi, Some(IntegrationPath::comb(4, 4)))
+            .expect_err("a 4 × 4 path cannot describe a 3 × 3 field");
         assert_eq!(
-            too_few,
-            UnwrappingError::WrongEdgeCount {
-                expected: 8,
-                got: 1
+            wrong_shape,
+            UnwrappingError::PathSizeMismatch {
+                field: (3, 3),
+                path: (4, 4)
             },
-            "a 3 × 3 spanning tree needs 8 edges"
-        );
-
-        // Eight edges, but one component is cut off and another has a cycle.
-        let disconnected = vec![
-            EdgeId::horizontal(0, 0),
-            EdgeId::horizontal(0, 1),
-            EdgeId::vertical(0, 0),
-            EdgeId::vertical(0, 1),
-            EdgeId::horizontal(1, 0),
-            EdgeId::horizontal(1, 1),
-            EdgeId::horizontal(2, 0),
-            EdgeId::horizontal(2, 1),
-        ];
-        assert!(
-            matches!(
-                Unwrapping::new(&psi, phi.clone(), &disconnected),
-                Err(UnwrappingError::NotSpanning { .. })
-            ),
-            "the bottom row is unreachable, so this is not a spanning tree"
-        );
-
-        let out_of_bounds = {
-            let mut tree = comb(3, 3);
-            tree[0] = EdgeId::horizontal(0, 9);
-            tree
-        };
-        assert_eq!(
-            Unwrapping::new(&psi, phi, &out_of_bounds).expect_err("the edge leaves the field"),
-            UnwrappingError::EdgeOutOfBounds(EdgeId::horizontal(0, 9)),
-            "an edge leaving the field must be rejected by name"
+            "a path has to cover the pixels it claims to walk"
         );
     }
 
@@ -791,7 +1222,7 @@ mod tests {
         let psi = wrapped_of(&ramp(3, 3));
         let wrong = ramp(3, 4);
         assert_eq!(
-            Unwrapping::new(&psi, wrong, &comb(3, 3))
+            Unwrapping::new(&psi, wrong, Some(IntegrationPath::comb(3, 3)))
                 .expect_err("the candidate is a different shape"),
             UnwrappingError::SizeMismatch {
                 wrapped: (3, 3),
@@ -804,8 +1235,9 @@ mod tests {
     #[test]
     fn accessors_reject_edges_and_corners_outside_the_field() {
         let psi = wrapped_of(&ramp(3, 4));
-        let phi = integrate(&psi, &comb(3, 4)).expect("spanning tree");
-        let unwrapping = Unwrapping::new(&psi, phi, &comb(3, 4)).expect("spanning tree");
+        let phi = integrate(&psi, &IntegrationPath::comb(3, 4)).expect("spanning tree");
+        let unwrapping =
+            Unwrapping::new(&psi, phi, Some(IntegrationPath::comb(3, 4))).expect("spanning tree");
 
         assert!(
             unwrapping.horizontal_edge(0, 2).is_some(),

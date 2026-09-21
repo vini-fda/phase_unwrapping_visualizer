@@ -42,7 +42,9 @@ const TAU: f32 = 6.2831855;
 
 // Traversal codes, matching `Traversal::code` on the Rust side.
 const TRAVERSAL_CUT: u32 = 0u;
-const TRAVERSAL_ABSENT: u32 = 3u;
+// Also stands for "no integration path was supplied", so such walls are drawn
+// plainly rather than as part of a walk that is not known.
+const TRAVERSAL_NO_ROLE: u32 = 3u;
 
 // Cell walls are drawn dark. `Colormap::Grayscale` keeps a non-zero floor so
 // that they stay visible even where the data bottoms out.
@@ -166,7 +168,7 @@ fn wall_along_axis(
             if u.overlay_flags.x > 0.5 {
                 out.color = CUT_WALL_GREEN;
             }
-        } else if traversal != TRAVERSAL_ABSENT {
+        } else if traversal != TRAVERSAL_NO_ROLE {
             // Part of the integration path: drawn faint and dashed, since the
             // walk passes straight through it, or left out altogether.
             if u.overlay_flags.y > 0.5 {

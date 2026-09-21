@@ -10,15 +10,28 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::graph::IntegrationPath;
+use crate::inputs::Slot;
 use crate::phase::PhaseField;
-use crate::phase_file::{self, EXTENSION};
+use crate::phase_file;
+
+/// What a chosen file turned out to hold.
+#[derive(Debug)]
+pub enum Payload {
+    /// A field of phase samples.
+    Phase(PhaseField),
+    /// A walk over the pixels.
+    Path(IntegrationPath),
+}
 
 /// A file the user chose, decoded or not.
 pub struct Opened {
+    /// Which input it was being opened for.
+    pub slot: Slot,
     /// What to call it in the UI. On the web this is all that is knowable.
     pub name: String,
-    /// The field, or why it could not be read.
-    pub result: Result<PhaseField, String>,
+    /// The contents, or why they could not be read.
+    pub result: Result<Payload, String>,
 }
 
 /// A picker whose result arrives whenever it arrives.
@@ -28,7 +41,9 @@ pub struct Opened {
 /// later.
 #[derive(Clone, Default)]
 pub struct FileDialog {
-    slot: Arc<Mutex<Option<Opened>>>,
+    /// Where a finished pick waits until the UI collects it. Named apart from
+    /// the input [`Slot`] it is filling, which is a different thing entirely.
+    pending: Arc<Mutex<Option<Opened>>>,
 }
 
 impl FileDialog {
@@ -37,19 +52,19 @@ impl FileDialog {
     /// Returns immediately on both platforms; the result shows up in
     /// [`Self::take`].
     #[cfg(target_arch = "wasm32")]
-    pub fn pick(&self) {
+    pub fn pick(&self, slot: Slot) {
         let dialog = rfd::AsyncFileDialog::new()
-            .add_filter("Phase field", &[EXTENSION])
-            .set_title("Open phase data");
+            .add_filter(slot.label(), &[slot.extension()])
+            .set_title(format!("Open {}", slot.label().to_lowercase()));
 
         // A browser never blocks on a file picker, and never reveals a path:
         // all that comes back is a handle to read bytes out of, later.
-        let slot = Arc::clone(&self.slot);
+        let pending = Arc::clone(&self.pending);
         wasm_bindgen_futures::spawn_local(async move {
             if let Some(handle) = dialog.pick_file().await {
                 let name = handle.file_name();
                 let bytes = handle.read().await;
-                store(&slot, decode_named(name, &bytes));
+                store(&pending, decode_named(slot, name, &bytes));
             }
         });
     }
@@ -62,12 +77,12 @@ impl FileDialog {
     ///
     /// [rfd]: https://docs.rs/rfd/latest/rfd/#macos-non-windowed-applications-async-and-threading
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn pick(&self) {
+    pub fn pick(&self, slot: Slot) {
         // The blocking API, so there is no executor to find: the call returns
         // once the user has chosen or cancelled.
         let path = rfd::FileDialog::new()
-            .add_filter("Phase field", &[EXTENSION])
-            .set_title("Open phase data")
+            .add_filter(slot.label(), &[slot.extension()])
+            .set_title(format!("Open {}", slot.label().to_lowercase()))
             .pick_file();
 
         let Some(path) = path else {
@@ -80,10 +95,11 @@ impl FileDialog {
         );
 
         match std::fs::read(&path) {
-            Ok(bytes) => store(&self.slot, decode_named(name, &bytes)),
+            Ok(bytes) => store(&self.pending, decode_named(slot, name, &bytes)),
             Err(error) => store(
-                &self.slot,
+                &self.pending,
                 Opened {
+                    slot,
                     name,
                     result: Err(error.to_string()),
                 },
@@ -92,13 +108,13 @@ impl FileDialog {
     }
 
     /// Accepts bytes that arrived some other way, such as a dropped file.
-    pub fn accept(&self, name: String, bytes: &[u8]) {
-        store(&self.slot, decode_named(name, bytes));
+    pub fn accept(&self, slot: Slot, name: String, bytes: &[u8]) {
+        store(&self.pending, decode_named(slot, name, bytes));
     }
 
     /// Takes the pending result, if one has arrived.
     pub fn take(&self) -> Option<Opened> {
-        self.slot.lock().ok()?.take()
+        self.pending.lock().ok()?.take()
     }
 }
 
@@ -107,9 +123,9 @@ impl FileDialog {
 /// A poisoned lock is dropped on the floor rather than propagated: the only
 /// thing behind it is one pending file, and losing it costs the user a second
 /// click.
-fn store(slot: &Mutex<Option<Opened>>, opened: Opened) {
-    if let Ok(mut slot) = slot.lock() {
-        *slot = Some(opened);
+fn store(pending: &Mutex<Option<Opened>>, opened: Opened) {
+    if let Ok(mut pending) = pending.lock() {
+        *pending = Some(opened);
     } else {
         log::error!(
             "the file dialog's slot was poisoned; dropping {}",
@@ -118,10 +134,15 @@ fn store(slot: &Mutex<Option<Opened>>, opened: Opened) {
     }
 }
 
-fn decode_named(name: String, bytes: &[u8]) -> Opened {
+fn decode_named(slot: Slot, name: String, bytes: &[u8]) -> Opened {
+    let result = match slot {
+        Slot::Path => phase_file::decode_path(bytes).map(Payload::Path),
+        _ => phase_file::decode(bytes).map(Payload::Phase),
+    };
     Opened {
+        slot,
         name,
-        result: phase_file::decode(bytes).map_err(|error| error.to_string()),
+        result: result.map_err(|error| error.to_string()),
     }
 }
 
@@ -134,11 +155,22 @@ mod tests {
         let dialog = FileDialog::default();
         assert!(dialog.take().is_none(), "nothing has been picked yet");
 
-        dialog.accept("example.phase".to_owned(), phase_file::EXAMPLE);
+        dialog.accept(
+            Slot::Original,
+            "example.phase".to_owned(),
+            phase_file::EXAMPLE,
+        );
 
         let opened = dialog.take().expect("the accepted file must be waiting");
         assert_eq!(opened.name, "example.phase", "the name is carried through");
-        let field = opened.result.expect("the example decodes");
+        assert_eq!(
+            opened.slot,
+            Slot::Original,
+            "the slot is carried through too"
+        );
+        let Payload::Phase(field) = opened.result.expect("the example decodes") else {
+            panic!("a .phase file must decode to phase samples");
+        };
         assert_eq!((field.rows(), field.cols()), (8, 8), "8 × 8");
 
         assert!(
@@ -150,7 +182,11 @@ mod tests {
     #[test]
     fn a_bad_file_reports_why_instead_of_being_dropped() {
         let dialog = FileDialog::default();
-        dialog.accept("truncated.phase".to_owned(), &phase_file::EXAMPLE[..40]);
+        dialog.accept(
+            Slot::Wrapped,
+            "truncated.phase".to_owned(),
+            &phase_file::EXAMPLE[..40],
+        );
 
         let opened = dialog.take().expect("a failure still reaches the UI");
         assert_eq!(

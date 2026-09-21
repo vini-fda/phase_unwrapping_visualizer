@@ -12,6 +12,7 @@ pub mod colormap;
 pub mod demo;
 pub mod file_dialog;
 pub mod graph;
+pub mod inputs;
 pub mod phase;
 pub mod phase_file;
 pub mod view;
