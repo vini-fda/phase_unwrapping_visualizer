@@ -15,6 +15,7 @@ pub mod graph;
 pub mod inputs;
 pub mod phase;
 pub mod phase_file;
+pub mod snaphu;
 pub mod view;
 
 pub use app::PhaseVisualizerApp;

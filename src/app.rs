@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::colormap::DisplayMode;
 use crate::demo::SceneSettings;
 use crate::file_dialog::{FileDialog, Payload};
-use crate::inputs::{Inputs, Origin, Resolved, Slot, Supplied};
+use crate::inputs::{Inputs, Origin, Resolved, Slot, Supplied, Unwrapper};
 use crate::phase::PhaseField;
 use crate::phase_file;
 use crate::render::{GridRenderer, OverlayOptions, OverlaySource};
@@ -532,6 +532,8 @@ impl PhaseVisualizerApp {
 
         let mut pick = None;
         let mut revert = None;
+        let mut choose_unwrapper = None;
+        let unwrapper = self.inputs.unwrapper;
 
         for slot in Slot::ALL {
             let state = self.inputs.state(slot);
@@ -541,20 +543,39 @@ impl PhaseVisualizerApp {
 
             let label = state.label();
 
-            // The two ways to fill a slot exclude each other, so they are one
-            // choice rather than two buttons: the box says which is in force,
-            // and picking the other switches to it.
+            // The ways to fill a slot exclude each other, so they are one
+            // choice rather than a row of buttons: the box says which is in
+            // force, and picking another switches to it. Every slot offers a
+            // file and one thing the viewer can do without one — except the
+            // candidate, which has an unwrapper to choose as well.
             let supplied = state.is_supplied();
+            let unwrappers = (slot == Slot::Unwrapped).then_some(Unwrapper::ALL);
             egui::ComboBox::from_id_salt(slot.label())
                 .selected_text(if supplied {
                     label.clone()
+                } else if unwrappers.is_some() {
+                    unwrapper.label().to_owned()
                 } else {
                     slot.fallback_label().to_owned()
                 })
                 .width(ui.available_width())
                 .truncate()
                 .show_ui(ui, |ui| {
-                    if ui
+                    if let Some(unwrappers) = unwrappers {
+                        for choice in unwrappers {
+                            if ui
+                                .selectable_label(!supplied && unwrapper == choice, choice.label())
+                                .on_hover_text(choice.tooltip())
+                                .clicked()
+                                // Picking the one already in force changes
+                                // nothing, and re-running an unwrapper for
+                                // nothing is a visible pause.
+                                && (supplied || choice != unwrapper)
+                            {
+                                choose_unwrapper = Some(choice);
+                            }
+                        }
+                    } else if ui
                         .selectable_label(!supplied, slot.fallback_label())
                         .on_hover_text(slot.fallback_tooltip())
                         .clicked()
@@ -591,6 +612,9 @@ impl PhaseVisualizerApp {
 
         if let Some(slot) = revert {
             self.use_synthetic(slot);
+        }
+        if let Some(choice) = choose_unwrapper {
+            self.use_unwrapper(choice);
         }
         if let Some(slot) = pick {
             self.dialog.pick(slot);
@@ -637,6 +661,30 @@ impl PhaseVisualizerApp {
             self.inputs.clear(slot);
         }
         self.resolve();
+    }
+
+    /// Makes the candidate with `unwrapper`, in place of whatever was filling
+    /// the slot.
+    ///
+    /// An unwrapper only ever gets to run when no file supplies a candidate, so
+    /// choosing one gives up any file that does — and the walk that came with
+    /// it, which described that file's candidate and not this one.
+    fn use_unwrapper(&mut self, unwrapper: Unwrapper) {
+        // Keep the previous inputs in hand: an unwrapper can refuse the field
+        // it is given — SNAPHU will not touch a masked sample — and a refusal
+        // should say so rather than empty the view, exactly as a file that does
+        // not fit does.
+        let previous = self.inputs.clone();
+
+        self.inputs.unwrapper = unwrapper;
+        self.inputs.clear(Slot::Unwrapped);
+        self.resolve();
+
+        if let Some(message) = self.error.clone() {
+            self.inputs = previous;
+            self.resolve();
+            self.error = Some(message);
+        }
     }
 
     /// The knobs behind the synthetic original phase.
@@ -1164,6 +1212,138 @@ mod tests {
         );
     }
 
+    /// The candidate slot offers a real unwrapper as well as the naive one.
+    /// Choosing it must rebuild the candidate — and leave no walk behind,
+    /// because SNAPHU solves for flows rather than walking a tree.
+    #[test]
+    fn choosing_snaphu_rebuilds_the_candidate_and_reports_no_path() {
+        let mut app = app();
+        app.settings.rows = 24;
+        app.settings.cols = 32;
+        app.use_generated_data();
+        app.tab = Tab::Unwrapped;
+        let naive = field_of(&app);
+
+        app.use_unwrapper(Unwrapper::Snaphu);
+
+        assert!(
+            app.error.is_none(),
+            "snaphu must unwrap the demo scene: {:?}",
+            app.error
+        );
+        let solved = field_of(&app);
+        assert_ne!(
+            naive.as_slice(),
+            solved.as_slice(),
+            "the noisy field has residues, which is exactly where the two unwrappers part"
+        );
+        assert_eq!(
+            app.inputs.state(Slot::Unwrapped),
+            crate::inputs::SlotState::Derived("unwrapped here by snaphu-rs".to_owned()),
+            "the sidebar must name the unwrapper that made what is on screen"
+        );
+        assert_eq!(
+            app.inputs.state(Slot::Path),
+            crate::inputs::SlotState::Missing(
+                "not provided — no walls or arrows for the path".to_owned()
+            ),
+            "and say that this candidate came with no walk"
+        );
+        assert!(
+            app.scene
+                .as_ref()
+                .is_some_and(|scene| !scene.scene.unwrapping.has_path()),
+            "so the overlay must not claim one"
+        );
+
+        // And back: the naive candidate is the viewer's own walk again.
+        app.use_unwrapper(Unwrapper::Naive);
+        assert!(
+            Arc::ptr_eq(&naive, &field_of(&app)) || naive.as_slice() == field_of(&app).as_slice(),
+            "the comb integration of the same ψ is the same candidate"
+        );
+        assert!(
+            app.scene
+                .as_ref()
+                .is_some_and(|scene| scene.scene.unwrapping.has_path()),
+            "and its walk is known again"
+        );
+    }
+
+    /// An unwrapper that refuses the field must report the refusal and leave
+    /// what was on screen alone — the choice failed, so it did not happen.
+    #[test]
+    fn an_unwrapper_that_refuses_leaves_the_view_alone() {
+        let mut app = app();
+        let (rows, cols) = (app.settings.rows, app.settings.cols);
+
+        // A masked sample: the viewer's own integration carries the NaN along,
+        // SNAPHU refuses the field outright.
+        let mut samples = vec![0.5f32; rows * cols];
+        samples[rows * cols / 2] = f32::NAN;
+        app.inputs.wrapped = Some(Supplied {
+            value: Arc::new(PhaseField::new(samples, rows, cols).expect("rows × cols samples")),
+            origin: Origin::File("masked.phase".to_owned()),
+        });
+        app.resolve();
+        assert!(app.error.is_none(), "the naive unwrapper takes it");
+        app.tab = Tab::Unwrapped;
+        let before = field_of(&app);
+
+        app.use_unwrapper(Unwrapper::Snaphu);
+
+        let error = app.error.as_ref().expect("the refusal must be reported");
+        assert!(
+            error.contains("snaphu-rs"),
+            "the message must name what refused, got {error:?}"
+        );
+        let after = field_of(&app);
+        assert!(
+            before
+                .as_slice()
+                .iter()
+                .zip(after.as_slice())
+                .all(|(before, after)| before == after || (before.is_nan() && after.is_nan())),
+            "and the candidate on screen must be the one that worked"
+        );
+        assert_eq!(
+            app.inputs.unwrapper,
+            Unwrapper::Naive,
+            "the choice that failed must not be left standing in the sidebar"
+        );
+    }
+
+    /// An unwrapper only runs when no file supplies a candidate, so choosing
+    /// one is also how a supplied candidate is given up — along with the walk
+    /// that described it.
+    #[test]
+    fn choosing_an_unwrapper_gives_up_a_supplied_candidate() {
+        let mut app = app();
+        let (rows, cols) = (app.settings.rows, app.settings.cols);
+        app.inputs.unwrapped = Some(Supplied {
+            value: Arc::new(PhaseField::linear_gradient(rows, cols, 1.0, 1.0)),
+            origin: Origin::File("phi.phase".to_owned()),
+        });
+        app.inputs.path = Some(Supplied {
+            value: Arc::new(crate::graph::IntegrationPath::comb(rows, cols)),
+            origin: Origin::File("phi.path".to_owned()),
+        });
+        app.resolve();
+
+        app.use_unwrapper(Unwrapper::Naive);
+
+        assert!(app.inputs.unwrapped.is_none(), "the file is given up");
+        assert!(
+            app.inputs.path.is_none(),
+            "and the walk that described its candidate with it"
+        );
+        assert_eq!(
+            app.inputs.state(Slot::Unwrapped),
+            crate::inputs::SlotState::Derived("integrated here along a comb path".to_owned()),
+            "the candidate is made here again"
+        );
+    }
+
     /// Clearing the candidate must clear the walk with it: a path describes how
     /// one particular candidate was built, and means nothing without it.
     #[test]
@@ -1313,7 +1493,24 @@ mod tests {
         assert_eq!(
             Slot::Unwrapped.fallback_label(),
             "Use naive unwrapping algorithm",
-            "the candidate's fallback is an algorithm, so the button says which"
+            "the candidate's fallback is an algorithm, so the entry says which"
+        );
+        // And it is a choice of algorithms, so every one of them has to name
+        // itself and say what it costs.
+        for unwrapper in Unwrapper::ALL {
+            assert!(
+                !unwrapper.label().is_empty() && !unwrapper.tooltip().is_empty(),
+                "{unwrapper:?} must name itself and explain itself"
+            );
+            assert!(
+                !unwrapper.derivation().is_empty(),
+                "{unwrapper:?} must describe the candidate it makes"
+            );
+        }
+        assert_ne!(
+            Unwrapper::Naive.label(),
+            Unwrapper::Snaphu.label(),
+            "two entries reading the same would be one choice the user cannot make"
         );
         for slot in [Slot::Original, Slot::Wrapped, Slot::Path] {
             assert_eq!(

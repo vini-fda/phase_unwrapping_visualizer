@@ -6,7 +6,7 @@
 //! |---|---|
 //! | **Original phase** — the phase before wrapping | the Truth tab has nothing to show |
 //! | **Wrapped phase** `ψ` — the observable | derived as `wrap(original)` |
-//! | **Unwrapped phase** `φ` — a candidate | integrated here along a comb path |
+//! | **Unwrapped phase** `φ` — a candidate | made here by whichever [`Unwrapper`] is chosen |
 //! | **Integration path** — the walk that produced `φ` | walls and arrows cannot say what the walk did |
 //!
 //! What cannot be missing is `ψ`, because everything else is measured against
@@ -50,6 +50,64 @@ pub struct Supplied<T> {
     pub value: T,
     /// Where it was obtained.
     pub origin: Origin,
+}
+
+/// Which algorithm fills the candidate slot when no file is supplied.
+///
+/// Both are unwrappers of ψ and nothing else, so either can be asked for at any
+/// time; they differ in what they are worth looking at for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Unwrapper {
+    /// Integrate ψ along a comb path — down the first column, then across each
+    /// row. Deliberately poor, and the default for that reason.
+    #[default]
+    Naive,
+    /// The snaphu-rs port of SNAPHU, at the fixed settings in
+    /// [`crate::snaphu`].
+    Snaphu,
+}
+
+impl Unwrapper {
+    /// Every unwrapper, worst first.
+    pub const ALL: [Self; 2] = [Self::Naive, Self::Snaphu];
+
+    /// What the entry in the slot's combo box says.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Naive => "Use naive unwrapping algorithm",
+            Self::Snaphu => "Use snaphu-rs",
+        }
+    }
+
+    /// What choosing it does, and what it costs.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Naive => {
+                "Integrate ψ here, along a comb path — down the first column, then across \
+                 each row.\n\n\
+                 The naive raster method, and a poor unwrapper deliberately: a single residue \
+                 it walks past smears a whole row. Its path is known exactly, because the \
+                 viewer chose it, so the walls and the arrows have something to show."
+            }
+            Self::Snaphu => {
+                "Unwrap ψ here with snaphu-rs, the Rust port of SNAPHU — statistical-cost \
+                 network-flow unwrapping, in smooth-cost mode at stock parameters.\n\n\
+                 A real unwrapper, and the thing worth comparing the naive one against. It \
+                 solves for flows rather than walking a tree, so it reports no integration \
+                 path: the residues and the disagreeing edges are still exact, but the walls \
+                 cannot separate cut from tree and the node view draws no arrows.\n\n\
+                 Runs on the spot, so a large field takes a moment."
+            }
+        }
+    }
+
+    /// How the sidebar describes a candidate this one produced.
+    pub fn derivation(self) -> &'static str {
+        match self {
+            Self::Naive => "integrated here along a comb path",
+            Self::Snaphu => "unwrapped here by snaphu-rs",
+        }
+    }
 }
 
 /// Which of the four inputs a file is being opened for.
@@ -111,15 +169,17 @@ impl Slot {
         }
     }
 
-    /// What the button that gives up this slot's file should say.
+    /// What the entry that gives up this slot's file should say.
     ///
     /// Each names the thing it falls back *to*, because "synthetic" means
     /// something different in each row: a generated field for the original, a
-    /// derivation for the wrapped phase, an algorithm for the candidate.
+    /// derivation for the wrapped phase, an algorithm for the candidate — and
+    /// the candidate has a choice of those, so it lists [`Unwrapper::ALL`]
+    /// instead and this only names the default one.
     pub fn fallback_label(self) -> &'static str {
         match self {
             Self::Original | Self::Wrapped | Self::Path => "Use synthetic",
-            Self::Unwrapped => "Use naive unwrapping algorithm",
+            Self::Unwrapped => Unwrapper::Naive.label(),
         }
     }
 
@@ -136,8 +196,8 @@ impl Slot {
                  original as ψ = wrap(original)."
             }
             Self::Unwrapped => {
-                "Stop using this file. The viewer goes back to integrating ψ itself, along a \
-                 comb path — and its own path is then known, so the walls and arrows come back."
+                "Stop using this file. The viewer goes back to unwrapping ψ itself, with \
+                 whichever of its own unwrappers is chosen."
             }
             Self::Path => {
                 "Stop using this file. With a supplied unwrapped phase and no path, the walls \
@@ -162,10 +222,13 @@ pub struct Inputs {
     pub original: Option<Supplied<Arc<PhaseField>>>,
     /// The observable phase, when supplied rather than derived.
     pub wrapped: Option<Supplied<Arc<PhaseField>>>,
-    /// A candidate unwrapping, when supplied rather than integrated here.
+    /// A candidate unwrapping, when supplied rather than made here.
     pub unwrapped: Option<Supplied<Arc<PhaseField>>>,
     /// The walk behind that candidate.
     pub path: Option<Supplied<Arc<IntegrationPath>>>,
+    /// Which unwrapper makes the candidate when no file supplies one. Idle
+    /// while a file does.
+    pub unwrapper: Unwrapper,
 }
 
 /// How a slot is currently being filled — supplied, derived, or not at all.
@@ -222,6 +285,8 @@ pub enum ResolveError {
     },
     /// The analysis rejected the combination.
     Unwrapping(UnwrappingError),
+    /// snaphu-rs refused to unwrap the wrapped phase.
+    Snaphu(snaphu_rs::SnaphuError),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -245,6 +310,7 @@ impl std::fmt::Display for ResolveError {
                 expected.1
             ),
             Self::Unwrapping(error) => write!(f, "{error}"),
+            Self::Snaphu(error) => write!(f, "snaphu-rs could not unwrap this field: {error}"),
         }
     }
 }
@@ -294,12 +360,15 @@ impl Inputs {
                     SlotState::Missing("not provided — nothing to show".to_owned())
                 }
             }
-            Slot::Unwrapped => SlotState::Derived("integrated here along a comb path".to_owned()),
+            Slot::Unwrapped => SlotState::Derived(self.unwrapper.derivation().to_owned()),
             Slot::Path => {
-                if self.unwrapped.is_some() {
-                    SlotState::Missing("not provided — no walls or arrows for the path".to_owned())
-                } else {
+                // Only the comb walk is a walk the viewer knows: a supplied
+                // candidate was produced elsewhere, and SNAPHU solves for flows
+                // rather than walking at all.
+                if self.unwrapped.is_none() && self.unwrapper == Unwrapper::Naive {
                     SlotState::Derived("comb path from (0, 0)".to_owned())
+                } else {
+                    SlotState::Missing("not provided — no walls or arrows for the path".to_owned())
                 }
             }
         }
@@ -385,17 +454,24 @@ impl Inputs {
             (None, None) => return Err(ResolveError::NoWrappedPhase),
         };
 
-        let (candidate, path) = if let Some(supplied) = self.unwrapped.as_ref() {
-            (
+        let (candidate, path) = match (self.unwrapped.as_ref(), self.unwrapper) {
+            (Some(supplied), _) => (
                 supplied.value.as_ref().clone(),
                 self.path.as_ref().map(|path| path.value.as_ref().clone()),
-            )
-        } else {
-            // No candidate given, so make the naive one — and then the path it
-            // followed is known exactly, because we chose it.
-            let comb = IntegrationPath::comb(expected.0, expected.1);
-            let integrated = demo::integrate(&wrapped, &comb).map_err(ResolveError::Unwrapping)?;
-            (integrated, Some(comb))
+            ),
+            // No candidate given, so make one. The comb walk is known exactly,
+            // because we chose it; SNAPHU's answer is a flow field and comes
+            // with no walk at all.
+            (None, Unwrapper::Naive) => {
+                let comb = IntegrationPath::comb(expected.0, expected.1);
+                let integrated =
+                    demo::integrate(&wrapped, &comb).map_err(ResolveError::Unwrapping)?;
+                (integrated, Some(comb))
+            }
+            (None, Unwrapper::Snaphu) => (
+                crate::snaphu::unwrap(&wrapped).map_err(ResolveError::Snaphu)?,
+                None,
+            ),
         };
 
         let unwrapping =

@@ -20,6 +20,9 @@ log = "0.4.27"
 serde = { version = "1.0.219", features = ["derive"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 
+# The SNAPHU port, offered as one of the unwrappers behind the candidate slot.
+snaphu-rs = { path = "../snaphu-rs" }
+
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11.8"
