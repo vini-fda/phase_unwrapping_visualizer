@@ -71,6 +71,21 @@ impl ViewTransform {
         Self::new(center, scale)
     }
 
+    /// [`Self::fit`], but never below `floor` points per cell.
+    ///
+    /// A representation that needs a minimum scale before it can draw anything
+    /// asks for one here. Fitting a large field lands well below the node
+    /// view's threshold, and the honest choice at that point is not the whole
+    /// field — it is the *nothing* the node view draws there, with a hint in
+    /// place of the diagram. Starting at the floor shows the middle of the
+    /// field instead, which is less than the field but more than nothing.
+    ///
+    /// A `floor` of zero, or a non-finite one, leaves the fit alone.
+    pub fn fit_at_least(rows: usize, cols: usize, viewport: Rect, floor: f32) -> Self {
+        let fitted = Self::fit(rows, cols, viewport);
+        Self::new(fitted.center, fitted.points_per_cell.max(floor))
+    }
+
     /// Screen points per cell.
     pub fn points_per_cell(&self) -> f32 {
         self.points_per_cell
@@ -259,6 +274,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The node view has nothing to draw below its threshold, so a fit that
+    /// lands under it starts at the threshold instead — the middle of the
+    /// field, legible, rather than the whole field and a hint.
+    #[test]
+    fn a_floor_lifts_a_fit_that_lands_below_it() {
+        let vp = viewport();
+        let (rows, cols) = (128, 160);
+        let floor = 16.0;
+
+        let fitted = ViewTransform::fit(rows, cols, vp);
+        assert!(
+            fitted.points_per_cell() < floor,
+            "this field is the case worth testing: {} px/cell",
+            fitted.points_per_cell()
+        );
+
+        let floored = ViewTransform::fit_at_least(rows, cols, vp, floor);
+        assert_eq!(
+            floored.points_per_cell(),
+            floor,
+            "a fit below the floor starts at the floor"
+        );
+        assert_eq!(
+            floored.center(),
+            fitted.center(),
+            "and still on the middle of the field"
+        );
+    }
+
+    #[test]
+    fn a_floor_below_the_fit_changes_nothing() {
+        let vp = viewport();
+        let fitted = ViewTransform::fit(4, 4, vp);
+        assert!(fitted.points_per_cell() > 16.0, "a small field fits large");
+        assert_eq!(
+            ViewTransform::fit_at_least(4, 4, vp, 16.0),
+            fitted,
+            "a fit that already clears the floor is the fit"
+        );
+        assert_eq!(
+            ViewTransform::fit_at_least(4, 4, vp, 0.0),
+            fitted,
+            "and asking for no floor is asking for the fit"
+        );
     }
 
     #[test]

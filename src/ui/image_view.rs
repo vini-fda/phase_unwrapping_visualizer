@@ -70,16 +70,22 @@ pub struct PhaseImage<'a> {
 ///
 /// Both representations share this, so a gesture means the same thing in
 /// either and switching between them never moves the view.
+///
+/// `min_points_per_cell` is the zoom below which the calling representation has
+/// nothing to show, and only applies to the first fit: it is a floor on where
+/// the view *starts*, never on where the user may take it.
 pub fn interact(
     ui: &mut Ui,
     rows: usize,
     cols: usize,
     view: &mut Option<ViewTransform>,
     external_zoom: f32,
+    min_points_per_cell: f32,
 ) -> (Rect, Response) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
 
-    let transform = view.get_or_insert_with(|| ViewTransform::fit(rows, cols, rect));
+    let transform = view
+        .get_or_insert_with(|| ViewTransform::fit_at_least(rows, cols, rect, min_points_per_cell));
 
     if response.dragged() {
         transform.pan_by_screen_delta(response.drag_delta());
@@ -121,7 +127,9 @@ impl PhaseImage<'_> {
     /// Draws the image, taking up all the remaining space in `ui`.
     pub fn show(self, ui: &mut Ui) -> PhaseImageOutput {
         let (rows, cols) = (self.field.rows(), self.field.cols());
-        let (rect, response) = interact(ui, rows, cols, self.view, self.external_zoom);
+        // The cell view draws something at any scale, so it fits to contain and
+        // asks for no floor.
+        let (rect, response) = interact(ui, rows, cols, self.view, self.external_zoom, 0.0);
 
         let view = self
             .view

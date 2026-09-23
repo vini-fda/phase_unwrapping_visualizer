@@ -110,8 +110,21 @@ pub struct PhaseVisualizerApp {
 
     /// Pan/zoom, shared by both tabs and both representations: the fields have
     /// the same shape, so switching never moves the view.
+    ///
+    /// `None` means "not positioned yet"; whichever representation draws next
+    /// fits the field to its viewport, which is the only place that knows how
+    /// large that is.
     #[serde(skip)]
     view: Option<ViewTransform>,
+
+    /// The field shape [`Self::view`] was positioned for.
+    ///
+    /// A rebuilt scene of that same shape keeps the view: changing the
+    /// unwrapper is a question about the same field, and answering it by
+    /// throwing away where the user was looking would hide the very difference
+    /// they asked for. A different shape has nothing to keep.
+    #[serde(skip)]
+    view_shape: Option<(usize, usize)>,
 
     #[serde(skip)]
     scene: Option<Loaded>,
@@ -143,6 +156,7 @@ impl Default for PhaseVisualizerApp {
             settings: SceneSettings::default(),
             overlay_options: OverlayOptions::default(),
             view: None,
+            view_shape: None,
             scene: None,
             inputs: Inputs::default(),
             dialog: FileDialog::default(),
@@ -183,9 +197,15 @@ impl PhaseVisualizerApp {
     /// matches what the sidebar says it came from.
     fn resolve(&mut self) {
         self.hover = None;
-        self.view = None;
         match self.inputs.resolve() {
             Ok(scene) => {
+                let shape = (scene.wrapped.rows(), scene.wrapped.cols());
+                if self.view_shape != Some(shape) {
+                    // A different field: re-fit it. Cleared rather than fitted
+                    // here, because only the view knows its own viewport.
+                    self.view = None;
+                    self.view_shape = Some(shape);
+                }
                 self.scene = Some(Loaded::new(scene));
                 self.error = None;
             }
@@ -742,6 +762,10 @@ impl PhaseVisualizerApp {
                 unwrapping.cols(),
                 &mut self.view,
                 zoom,
+                // Fitting a large field lands below the scale this view draws
+                // at, so it starts where the nodes are legible instead of on a
+                // hint telling the user to zoom in.
+                node_view::MIN_POINTS_PER_CELL,
             );
             let Some(view) = self.view else {
                 return;
@@ -1067,6 +1091,9 @@ mod tests {
         app.tab = Tab::Truth;
         let before = field_of(&app);
 
+        // A positioned view, so the re-fit below is something rather than nothing.
+        app.view = Some(ViewTransform::new(egui::pos2(9.0, 3.0), 21.0));
+
         app.load_example();
         app.poll_incoming_file(&egui::Context::default());
 
@@ -1311,6 +1338,49 @@ mod tests {
             Unwrapper::Naive,
             "the choice that failed must not be left standing in the sidebar"
         );
+    }
+
+    /// Swapping the unwrapper asks a question about the same field, so the
+    /// answer has to arrive where the user is looking. Re-fitting would send
+    /// them back to the whole field every time, which is the one view where the
+    /// difference between two candidates is hardest to see.
+    #[test]
+    fn changing_the_unwrapper_keeps_the_view() {
+        let mut app = app();
+        app.settings.rows = 24;
+        app.settings.cols = 32;
+        app.use_generated_data();
+
+        let looking_at = ViewTransform::new(egui::pos2(7.5, 4.25), 38.0);
+        app.view = Some(looking_at);
+
+        app.use_unwrapper(Unwrapper::Snaphu);
+        assert_eq!(
+            app.view,
+            Some(looking_at),
+            "a candidate of the same shape must not move the view"
+        );
+
+        app.use_unwrapper(Unwrapper::Naive);
+        assert_eq!(
+            app.view,
+            Some(looking_at),
+            "and neither must switching back"
+        );
+
+        // The same field regenerated is still the same field, shape-wise.
+        app.settings.seed = app.settings.seed.wrapping_add(1);
+        app.regenerate();
+        assert_eq!(
+            app.view,
+            Some(looking_at),
+            "a fresh noise field of the same shape is still that shape"
+        );
+
+        // A different shape is a different field, and has nothing to keep.
+        app.settings.rows = 12;
+        app.use_generated_data();
+        assert!(app.view.is_none(), "a 12 x 32 field must be fitted afresh");
     }
 
     /// An unwrapper only runs when no file supplies a candidate, so choosing
