@@ -11,7 +11,7 @@
 //! | 64     | …    | the payload, row-major                      |
 //!
 //! The payload is `4mn` bytes of `f32` for [`Kind::Phase`], and `mn` bytes of
-//! [`ParentDirection`] codes for [`Kind::Parents`]. The kind byte lives in what
+//! [`ParentDirection`](crate::graph::ParentDirection) codes for [`Kind::Parents`]. The kind byte lives in what
 //! used to be reserved space and is zero in every file written before it
 //! existed, which is exactly why zero means "phase samples".
 //!
@@ -53,7 +53,7 @@ pub const PATH_EXTENSION: &str = "path";
 pub enum Kind {
     /// `4mn` bytes: one `f32` phase sample per pixel.
     Phase,
-    /// `mn` bytes: one [`ParentDirection`] code per pixel.
+    /// `mn` bytes: one [`ParentDirection`](crate::graph::ParentDirection) code per pixel.
     Parents,
 }
 

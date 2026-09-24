@@ -710,7 +710,7 @@ impl Unwrapping {
     /// `[right traversal, right |jump|, down traversal, down |jump|]`.
     ///
     /// The last column has no right edge and the last row has no bottom edge;
-    /// those slots carry [`EDGE_ABSENT`].
+    /// those slots carry [`EDGE_NO_ROLE`] and a zero jump.
     pub fn edge_texels(&self) -> Vec<u8> {
         let (rows, cols) = (self.rows(), self.cols());
         let mut texels = Vec::with_capacity(rows * cols * 4);
