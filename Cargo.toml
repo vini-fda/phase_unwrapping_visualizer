@@ -90,6 +90,7 @@ as_ptr_cast_mut = "warn"
 await_holding_lock = "warn"
 branches_sharing_code = "warn"
 char_lit_as_u8 = "warn"
+chunks_exact_to_as_chunks = "allow" # https://github.com/rust-lang/rust-clippy/issues/17359
 clear_with_drain = "warn"
 clone_on_ref_ptr = "warn"
 coerce_container_to_any = "warn"
