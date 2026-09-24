@@ -16,10 +16,10 @@ use crate::view::ViewTransform;
 /// Which field the viewer is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum Tab {
-    /// The phase before wrapping: what the unwrapping is trying to recover.
+    /// Ground truth. This is the original phase before wrapping, and what the unwrapping is trying to recover.
     ///
-    /// Demo-only. A real interferogram arrives already wrapped and there is
-    /// nothing to compare against — which is the whole difficulty.
+    /// This is theoretical. A real interferogram arrives already wrapped and there is
+    /// nothing to compare against.
     #[default]
     Truth,
     /// The observable phase, wrapped into `(-π, π]`.
@@ -43,10 +43,8 @@ impl Tab {
 
     fn tooltip(self) -> &'static str {
         match self {
-            Self::Truth => {
-                "φ before wrapping — the ramp the demo generated. Not observable in practice."
-            }
-            Self::Wrapped => "ψ = wrap(truth), the observable phase in (-π, π]",
+            Self::Truth => "original phase before wrapping (not observable in practice).",
+            Self::Wrapped => "psi = wrap(truth), the observable phase in (-π, π]",
             Self::Unwrapped => "A candidate unwrapping of ψ, and the path that produced it",
         }
     }
@@ -335,9 +333,6 @@ impl PhaseVisualizerApp {
     }
 
     /// The values at the two ends of the colormap, for the current mode.
-    ///
-    /// Wrapped mode always spans exactly one turn, whatever the data's own
-    /// range — both views ask this, so neither can answer it differently.
     fn effective_range(&self, range: (f32, f32)) -> (f32, f32) {
         if self.mode.is_wrapped() {
             (-PI, PI)
@@ -463,8 +458,8 @@ impl PhaseVisualizerApp {
         } else {
             ui.colored_label(ui.visuals().warn_fg_color, "no path provided")
                 .on_hover_text(
-                    "The residues and the disagreeing edges below are still exact — they \
-                 need only ψ and φ. What is missing is which edges the walk used, so \
+                    "The residues and the disagreeing edges below are still exact, since they \
+                 need only ψ (wrapped phase) and φ (original phase). What is missing is which edges the integration path used, so \
                  the walls cannot separate cut edges from the path and the node view \
                  cannot draw arrows.",
                 );
@@ -512,10 +507,7 @@ impl PhaseVisualizerApp {
                 swatch(ui, TREE_WALL_SWATCH, "integration path (dashed)");
             })
             .response
-            .on_hover_text(
-                "Draw the walls the integration walks through. Off, only the cut \
-                 edges remain — the spanning tree of the dual graph on its own.",
-            );
+            .on_hover_text("Draw the cell walls through which the integration path crosses.");
 
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.overlay_options.green_cut_edges, "");
@@ -536,9 +528,8 @@ impl PhaseVisualizerApp {
 
     /// What the viewer is currently working from, slot by slot.
     ///
-    /// Every row says where its data came from, or — when nothing was supplied
-    /// — what is being done instead and what that costs, so the display is
-    /// never quietly standing on something the user did not choose.
+    /// Every row says where its data came from, or (when nothing was supplied)
+    /// what is being done instead.
     fn sources_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| self.sources_contents(ui));
     }
@@ -565,8 +556,8 @@ impl PhaseVisualizerApp {
 
             // The ways to fill a slot exclude each other, so they are one
             // choice rather than a row of buttons: the box says which is in
-            // force, and picking another switches to it. Every slot offers a
-            // file and one thing the viewer can do without one — except the
+            // effect, and picking another switches to it. Every slot offers a
+            // file and one thing the viewer can do without one, except the
             // candidate, which has an unwrapper to choose as well.
             let supplied = state.is_supplied();
             let unwrappers = (slot == Slot::Unwrapped).then_some(Unwrapper::ALL);
@@ -617,7 +608,7 @@ impl PhaseVisualizerApp {
                 .on_hover_text(&label);
 
             // A supplied file is already named in the box above, so only the
-            // other two states have anything left to add — and one of them is
+            // other two states have anything left to add, and one of them is
             // a warning, which a file name would never be.
             match &state {
                 crate::inputs::SlotState::Supplied(_) => {}
@@ -686,7 +677,7 @@ impl PhaseVisualizerApp {
     /// Makes the candidate with `unwrapper`, in place of whatever was filling
     /// the slot.
     ///
-    /// An unwrapper only ever gets to run when no file supplies a candidate, so
+    /// An unwrapper is only used when no file supplies a candidate, so
     /// choosing one gives up any file that does — and the walk that came with
     /// it, which described that file's candidate and not this one.
     fn use_unwrapper(&mut self, unwrapper: Unwrapper) {
