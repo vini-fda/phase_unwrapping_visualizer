@@ -1,10 +1,10 @@
 //! Synthetic data, so the viewer has something to show.
 //!
 //! The viewer itself ingests a candidate unwrapping and an integration path
-//! from outside; this module only manufactures a plausible pair. It contains
-//! the one piece of unwrapping *algorithm* in the crate — [`integrate`], the
-//! naive path integration — which exists to produce a candidate worth looking
-//! at, not as the project's answer to the problem.
+//! from outside; this module only manufactures a plausible pair. It holds the
+//! crate's one unwrapping *algorithm*, the naive path integration in
+//! [`integrate`]. It exists to produce a candidate worth looking at, not as the
+//! project's answer to the problem.
 
 use std::f32::consts::TAU;
 
@@ -79,7 +79,7 @@ pub fn noisy_ramp(
     PhaseField::new(data, rows, cols).expect("the field was built row by row")
 }
 
-/// Wraps every sample of `field` into `(-π, π]`.
+/// Wraps every sample of `field` into `(-pi, pi]`.
 pub fn wrap_field(field: &PhaseField) -> PhaseField {
     let data = field.as_slice().iter().copied().map(phase::wrap).collect();
     PhaseField::new(data, field.rows(), field.cols()).expect("wrapping preserves the shape")
@@ -87,9 +87,9 @@ pub fn wrap_field(field: &PhaseField) -> PhaseField {
 
 /// Integrates `wrapped` along `path`, seeded at the path's root.
 ///
-/// Every step adds the wrapped difference across one edge, which is exactly
-/// what makes each edge of the path consistent by construction — and leaves the
-/// cut edges free to disagree wherever a residue is enclosed.
+/// Every step adds the wrapped difference across one edge, so each edge of the
+/// path is consistent by construction. The cut edges are left free to disagree
+/// wherever a residue is enclosed.
 ///
 /// The parent array does the work an adjacency list used to: each pixel names
 /// the one it was reached from, so the walk is a chain to follow rather than a
@@ -166,8 +166,8 @@ pub fn integrate(
 /// observe, and a candidate unwrapping of it.
 #[derive(Clone, Debug)]
 pub struct Scene {
-    /// The phase before wrapping. Not observable in practice — it is here so
-    /// the reconstruction can be compared against the thing it is reconstructing.
+    /// The phase before wrapping. Not observable in practice; it is here so the
+    /// reconstruction can be compared against what it is reconstructing.
     pub truth: PhaseField,
     /// `wrap(truth)`: the observable.
     pub wrapped: PhaseField,
@@ -225,8 +225,8 @@ impl Scene {
         ))
     }
 
-    /// Builds a scene around a phase field that came from somewhere else — a
-    /// `.phase` file, say — rather than from the generator.
+    /// Builds a scene around a phase field from outside the generator, such as
+    /// a `.phase` file.
     ///
     /// The field is treated as the phase before wrapping, exactly as the
     /// generated one is: it is wrapped, integrated along the comb path, and the
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn integration_reproduces_a_field_that_was_never_wrapped() {
-        // Steps well under π, so wrapping loses nothing and the integral must
+        // Steps well under pi, so wrapping loses nothing and the integral must
         // return the original ramp up to the constant it was seeded with.
         let (rows, cols) = (8, 9);
         let truth = noisy_ramp(rows, cols, 0.5, 0.25, 0.0, 1);
@@ -401,7 +401,7 @@ mod tests {
         use std::f32::consts::PI;
         let wrapped = wrap_field(&noisy_ramp(16, 16, 3.0, 3.0, 1.0, 5));
         for &value in wrapped.as_slice() {
-            assert!(-PI < value && value <= PI, "{value} escaped (-π, π]");
+            assert!(-PI < value && value <= PI, "{value} escaped (-pi, pi]");
         }
     }
 

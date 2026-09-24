@@ -10,7 +10,7 @@
 //!
 //! *Screen space* is egui's: points (not physical pixels), `y` down.
 //!
-//! The mapping is a uniform scale plus a translation — never an anisotropic one,
+//! The mapping is a uniform scale plus a translation, never an anisotropic one,
 //! so cells always stay square.
 
 use egui::{Pos2, Rect, Vec2, pos2};
@@ -75,10 +75,9 @@ impl ViewTransform {
     ///
     /// A representation that needs a minimum scale before it can draw anything
     /// asks for one here. Fitting a large field lands well below the node
-    /// view's threshold, and the honest choice at that point is not the whole
-    /// field — it is the *nothing* the node view draws there, with a hint in
-    /// place of the diagram. Starting at the floor shows the middle of the
-    /// field instead, which is less than the field but more than nothing.
+    /// view's threshold, where the node view draws nothing but a hint. Starting
+    /// at the floor shows the middle of the field instead: less than the whole
+    /// field, but more than nothing.
     ///
     /// A `floor` of zero, or a non-finite one, leaves the fit alone.
     pub fn fit_at_least(rows: usize, cols: usize, viewport: Rect, floor: f32) -> Self {
@@ -277,8 +276,8 @@ mod tests {
     }
 
     /// The node view has nothing to draw below its threshold, so a fit that
-    /// lands under it starts at the threshold instead — the middle of the
-    /// field, legible, rather than the whole field and a hint.
+    /// lands under it starts at the threshold instead. That shows the middle of
+    /// the field legibly, rather than a hint where the whole field should be.
     #[test]
     fn a_floor_lifts_a_fit_that_lands_below_it() {
         let vp = viewport();

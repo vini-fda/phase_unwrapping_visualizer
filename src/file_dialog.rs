@@ -2,9 +2,9 @@
 //!
 //! Native and web cannot share one code path: a native dialog blocks and hands
 //! back a path, while a browser can only ever hand over bytes asynchronously,
-//! and never a path at all. The shape here — a synchronous branch for native, a
-//! spawned future for the web, both ending in the same slot the UI polls — is
-//! the one [rerun's `file_dialog.rs`][rerun] uses for the same split.
+//! and never a path at all. So native gets a synchronous branch and the web a
+//! spawned future, and both end in the same slot the UI polls. This is how
+//! [rerun's `file_dialog.rs`][rerun] handles the same split.
 //!
 //! [rerun]: https://github.com/rerun-io/rerun/blob/main/crates/viewer_support/re_viewer_context/src/file_dialog.rs
 

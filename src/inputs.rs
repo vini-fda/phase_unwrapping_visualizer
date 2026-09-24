@@ -2,21 +2,21 @@
 //!
 //! Four things go in, and only one of them is strictly required:
 //!
-//! | Input | If absent |
-//! |---|---|
-//! | **Original phase** — the phase before wrapping | the Truth tab has nothing to show |
-//! | **Wrapped phase** `ψ` — the observable | derived as `wrap(original)` |
-//! | **Unwrapped phase** `φ` — a candidate | made here by whichever [`Unwrapper`] is chosen |
-//! | **Integration path** — the walk that produced `φ` | walls and arrows cannot say what the walk did |
+//! | Input | What it is | If absent |
+//! |---|---|---|
+//! | **Original phase** | the phase before wrapping | the Truth tab has nothing to show |
+//! | **Wrapped phase** `psi` | the observable | derived as `wrap(original)` |
+//! | **Unwrapped phase** `phi` | a candidate | made here by whichever [`Unwrapper`] is chosen |
+//! | **Integration path** | the walk that produced `phi` | walls and arrows cannot say what the walk did |
 //!
-//! What cannot be missing is `ψ`, because everything else is measured against
-//! it — so at least one of the original or the wrapped phase has to be there.
+//! Everything is measured against `psi`, so it cannot be missing. At least one of
+//! the original or the wrapped phase has to be there.
 //!
-//! A supplied `ψ` is never overwritten by one derived from the original. An
-//! unwrapper consumed some particular `ψ`, and if the viewer measured against a
-//! different one — a different mask, a different wrapping convention, a
-//! filtering step in between — every reported disagreement would be an artefact
-//! of the mismatch rather than a property of the unwrapping.
+//! A supplied `psi` is never overwritten by one derived from the original. An
+//! unwrapper consumed some particular `psi`. If the viewer measured against a
+//! different one (another mask, another wrapping convention, a filtering step in
+//! between), every reported disagreement would come from the mismatch rather
+//! than from the unwrapping.
 
 use std::sync::Arc;
 
@@ -54,11 +54,11 @@ pub struct Supplied<T> {
 
 /// Which algorithm fills the candidate slot when no file is supplied.
 ///
-/// Both are unwrappers of ψ and nothing else, so either can be asked for at any
+/// Both are unwrappers of psi and nothing else, so either can be asked for at any
 /// time; they differ in what they are worth looking at for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Unwrapper {
-    /// Integrate ψ along a comb path — down the first column, then across each
+    /// Integrate psi along a comb path: down the first column, then across each
     /// row. Deliberately poor, and the default for that reason.
     #[default]
     Naive,
@@ -83,15 +83,16 @@ impl Unwrapper {
     pub fn tooltip(self) -> &'static str {
         match self {
             Self::Naive => {
-                "Integrate ψ here, along a comb path — down the first column, then across \
+                "Integrate psi here along a comb path: down the first column, then across \
                  each row.\n\n\
                  The naive raster method, and a poor unwrapper deliberately: a single residue \
                  it walks past smears a whole row. Its path is known exactly, because the \
                  viewer chose it, so the walls and the arrows have something to show."
             }
             Self::Snaphu => {
-                "Unwrap ψ here with snaphu-rs, the Rust port of SNAPHU — statistical-cost \
-                 network-flow unwrapping, in smooth-cost mode at stock parameters.\n\n\
+                "Unwrap psi here with snaphu-rs, the Rust port of SNAPHU. It does \
+                 statistical-cost network-flow unwrapping, here in smooth-cost mode at stock \
+                 parameters.\n\n\
                  A real unwrapper, and the thing worth comparing the naive one against. It \
                  solves for flows rather than walking a tree, so it reports no integration \
                  path: the residues and the disagreeing edges are still exact, but the walls \
@@ -141,30 +142,30 @@ impl Slot {
     pub fn tooltip(self) -> &'static str {
         match self {
             Self::Original => {
-                "The phase before wrapping — the thing an unwrapping is trying to recover.\n\n\
+                "The phase before wrapping, which an unwrapping tries to recover.\n\n\
                  Optional. Only the Truth tab shows it, and a real interferogram does not come \
                  with one. If given and no wrapped phase is, the wrapped phase is derived from \
-                 it as ψ = wrap(original)."
+                 it as psi = wrap(original)."
             }
             Self::Wrapped => {
-                "The observable phase ψ, inside (-π, π]. Everything else is measured against it.\n\n\
+                "The observable phase psi, inside (-pi, pi]. Everything else is measured against it.\n\n\
                  Required, but it can come from the original instead: supply one or the other. \
-                 If your unwrapping was produced elsewhere, supply the very same ψ it consumed, \
+                 If your unwrapping was produced elsewhere, supply the very same psi it consumed, \
                  or the disagreeing edges describe the mismatch rather than the unwrapping."
             }
             Self::Unwrapped => {
-                "A candidate unwrapping φ, congruent to ψ modulo 2π.\n\n\
-                 Optional. Without one the viewer makes its own by integrating ψ along a comb \
-                 path — down the first column, then across each row — which is the naive raster \
-                 method and a poor unwrapper, deliberately."
+                "A candidate unwrapping phi, congruent to psi modulo 2pi.\n\n\
+                 Optional. Without one the viewer makes its own by integrating psi down the first \
+                 column, then across each row. That is the naive raster method, a deliberately \
+                 poor unwrapper."
             }
             Self::Path => {
                 "The walk that produced the unwrapped phase, as one byte per pixel naming the \
                  neighbour each was reached from.\n\n\
                  Optional, and only meaningful alongside a supplied unwrapped phase. Without it \
-                 the residues and the disagreeing edges are still exact — they need only ψ and φ \
-                 — but the walls cannot separate cut edges from the path and the node view cannot \
-                 draw arrows."
+                 the residues and the disagreeing edges are still exact, since they need only psi \
+                 and phi. But the walls cannot separate cut edges from the path, and the node view \
+                 cannot draw arrows."
             }
         }
     }
@@ -173,9 +174,9 @@ impl Slot {
     ///
     /// Each names the thing it falls back *to*, because "synthetic" means
     /// something different in each row: a generated field for the original, a
-    /// derivation for the wrapped phase, an algorithm for the candidate — and
-    /// the candidate has a choice of those, so it lists [`Unwrapper::ALL`]
-    /// instead and this only names the default one.
+    /// derivation for the wrapped phase, an algorithm for the candidate. The
+    /// candidate has several algorithms, listed in [`Unwrapper::ALL`], so this
+    /// names only the default one.
     pub fn fallback_label(self) -> &'static str {
         match self {
             Self::Original | Self::Wrapped | Self::Path => "Use synthetic",
@@ -193,10 +194,10 @@ impl Slot {
             }
             Self::Wrapped => {
                 "Stop using this file. The wrapped phase goes back to being derived from the \
-                 original as ψ = wrap(original)."
+                 original as psi = wrap(original)."
             }
             Self::Unwrapped => {
-                "Stop using this file. The viewer goes back to unwrapping ψ itself, with \
+                "Stop using this file. The viewer goes back to unwrapping psi itself, with \
                  whichever of its own unwrappers is chosen."
             }
             Self::Path => {
@@ -231,7 +232,7 @@ pub struct Inputs {
     pub unwrapper: Unwrapper,
 }
 
-/// How a slot is currently being filled — supplied, derived, or not at all.
+/// How a slot is currently being filled: supplied, derived, or not at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotState {
     /// Supplied directly, from here.
@@ -350,14 +351,12 @@ impl Inputs {
         }
 
         match slot {
-            Slot::Original => {
-                SlotState::Missing("not provided — the Truth tab is empty".to_owned())
-            }
+            Slot::Original => SlotState::Missing("not provided: the Truth tab is empty".to_owned()),
             Slot::Wrapped => {
                 if self.original.is_some() {
-                    SlotState::Derived("derived: ψ = wrap(original)".to_owned())
+                    SlotState::Derived("derived: psi = wrap(original)".to_owned())
                 } else {
-                    SlotState::Missing("not provided — nothing to show".to_owned())
+                    SlotState::Missing("not provided: nothing to show".to_owned())
                 }
             }
             Slot::Unwrapped => SlotState::Derived(self.unwrapper.derivation().to_owned()),
@@ -368,7 +367,7 @@ impl Inputs {
                 if self.unwrapped.is_none() && self.unwrapper == Unwrapper::Naive {
                     SlotState::Derived("comb path from (0, 0)".to_owned())
                 } else {
-                    SlotState::Missing("not provided — no walls or arrows for the path".to_owned())
+                    SlotState::Missing("not provided: no walls or arrows for the path".to_owned())
                 }
             }
         }
@@ -446,7 +445,7 @@ impl Inputs {
             }
         }
 
-        // A supplied ψ wins over one derived from the original: it is what the
+        // A supplied psi wins over one derived from the original: it is what the
         // unwrapping was actually measured against.
         let wrapped = match (self.wrapped.as_ref(), self.original.as_ref()) {
             (Some(supplied), _) => Arc::clone(&supplied.value),

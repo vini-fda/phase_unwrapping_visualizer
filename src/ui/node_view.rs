@@ -1,8 +1,8 @@
 //! The node representation: pixels as graph vertices, phase differences as
 //! edges.
 //!
-//! This is the same graph as the cell view, drawn the other way round — and the
-//! same data space, so it shares the viewer's [`ViewTransform`] unchanged.
+//! This is the same graph as the cell view, drawn the other way round. It uses
+//! the same data space, so it shares the viewer's [`ViewTransform`] unchanged.
 //! Pixel `(row, col)` sits at `(col + 0.5, row + 0.5)` and the residue between
 //! four pixels at `(col + 1, row + 1)`, which is exactly where the cell view
 //! puts the corresponding inner corner.
@@ -166,7 +166,7 @@ pub fn show(
 /// What to say when the diagram cannot show a walk.
 pub fn path_hint(unwrapping: &Unwrapping) -> Option<&'static str> {
     (!unwrapping.has_path()).then_some(
-        "No integration path provided — edges are drawn plain, with no arrows.          Open one with File → Open integration path…",
+        "No integration path provided, so edges are drawn plain, with no arrows.          Open one with File → Open integration path…",
     )
 }
 
@@ -174,7 +174,7 @@ pub fn path_hint(unwrapping: &Unwrapping) -> Option<&'static str> {
 pub fn zoom_hint(points_per_cell: f32) -> Option<String> {
     (points_per_cell < MIN_POINTS_PER_CELL).then(|| {
         format!(
-            "Zoom in to read the node graph — {points_per_cell:.0} px/cell, needs {MIN_POINTS_PER_CELL:.0}"
+            "Zoom in to read the node graph: {points_per_cell:.0} px/cell, needs {MIN_POINTS_PER_CELL:.0}"
         )
     })
 }
@@ -182,8 +182,8 @@ pub fn zoom_hint(points_per_cell: f32) -> Option<String> {
 /// The colour a node carries.
 ///
 /// Both the colormap and the position along it come from the display mode, so
-/// a node is coloured exactly as the cell view would colour the same sample —
-/// wrapped first when the mode says so, rather than stretched across the
+/// a node is coloured exactly as the cell view would colour the same sample.
+/// When the mode says so it is wrapped first, rather than stretched across the
 /// field's whole unbounded range.
 fn node_color(mode: DisplayMode, value: f32, value_range: (f32, f32)) -> Color32 {
     let t = crate::render::colormap_position(value, mode.is_wrapped(), value_range);
@@ -369,7 +369,7 @@ mod tests {
             assert_eq!(
                 node_color(DisplayMode::Wrapped, value, range),
                 node_color(DisplayMode::Wrapped, value + TAU, range),
-                "{value} and {value} + 2π are the same wrapped phase"
+                "{value} and {value} + 2pi are the same wrapped phase"
             );
             assert_eq!(
                 node_color(DisplayMode::Wrapped, value, range),
@@ -388,7 +388,7 @@ mod tests {
     }
 
     /// A node and the cell under it are the same sample, so they must be the
-    /// same colour — the two views take entirely different paths to it.
+    /// same colour, even though the two views compute it entirely differently.
     #[test]
     fn a_node_is_coloured_exactly_as_its_cell_would_be() {
         let range = (-4.0, 19.0);

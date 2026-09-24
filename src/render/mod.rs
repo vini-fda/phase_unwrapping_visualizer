@@ -79,7 +79,7 @@ pub fn residue_radius(pixels_per_cell: f32) -> f32 {
 pub struct OverlayOptions {
     /// Colour the edges whose integration delta is not the wrapped delta.
     ///
-    /// Turning this off does not hide those edges — they fall back to the wall
+    /// Turning this off does not hide those edges. They fall back to the wall
     /// their role in the integration path calls for, so the cut/tree structure
     /// stays readable underneath.
     pub highlight_edges: bool,
@@ -87,8 +87,8 @@ pub struct OverlayOptions {
     /// Draw the residue charges at the inner corners.
     pub show_residues: bool,
 
-    /// Draw the cut edges — the spanning tree of the dual — in green instead
-    /// of the default near-black.
+    /// Draw the cut edges (the spanning tree of the dual) in green instead of
+    /// the default near-black.
     ///
     /// The image border is left neutral either way: it bounds the outer face
     /// `O` and is not an edge of `G`, so colouring it would blur the very
@@ -114,9 +114,6 @@ impl Default for OverlayOptions {
 }
 
 /// The `(offset, reciprocal span)` a linear colour mapping multiplies by.
-///
-/// A degenerate range would divide by zero, so it maps the whole field to the
-/// middle of the colormap instead — which is what a constant field means.
 fn linear_mapping(value_range: (f32, f32)) -> (f32, f32) {
     let (min, max) = value_range;
     if max > min && (max - min).is_finite() {
@@ -165,7 +162,7 @@ pub struct GridUniforms {
     pub value_min: f32,
     /// Reciprocal of the value range.
     pub value_range_inv: f32,
-    /// `1.0` to wrap values to `(-π, π]` before colouring, `0.0` otherwise.
+    /// `1.0` to wrap values to `(-pi, pi]` before colouring, `0.0` otherwise.
     pub wrap_mode: f32,
     /// Wall opacity, from [`wall_opacity`].
     pub wall_opacity: f32,
@@ -275,9 +272,9 @@ struct DataTexture {
     ///
     /// Holding the `Arc` is what makes the staleness check sound: while it is
     /// alive nothing else can occupy that allocation, so pointer equality means
-    /// the same immutable samples. A hand-maintained counter cannot do this —
-    /// the viewer shows two different fields of identical size, and a counter
-    /// that identified only the *scene* let a tab switch slip through and left
+    /// the same immutable samples. A hand-maintained counter cannot do this.
+    /// The viewer shows two different fields of identical size, and a counter
+    /// that identified only the *scene* let a tab switch slip through, leaving
     /// the other tab's samples on screen.
     source: Arc<PhaseField>,
 }
@@ -887,7 +884,7 @@ fn flag(on: bool) -> f32 {
 /// Identity, not contents or size: the viewer shows several fields of exactly
 /// the same shape, so anything coarser than "is this the very same allocation"
 /// silently keeps the wrong samples on the GPU. Holding the `Arc` while it is
-/// compared is what makes pointer equality sound — the allocation cannot be
+/// compared makes pointer equality sound, because the allocation cannot be
 /// reused underneath it.
 fn needs_upload<T>(uploaded: Option<&Arc<T>>, incoming: &Arc<T>) -> bool {
     !uploaded.is_some_and(|uploaded| Arc::ptr_eq(uploaded, incoming))
@@ -913,8 +910,8 @@ fn to_le_bytes(values: &[f32]) -> Vec<u8> {
 
 /// One frame's worth of "draw the grid like this".
 ///
-/// Holds only plain data — the GPU resources live in the callback resources —
-/// so it satisfies the `Send + Sync` bound `CallbackTrait` requires.
+/// Holds only plain data, so it satisfies the `Send + Sync` bound
+/// `CallbackTrait` requires. The GPU resources live in the callback resources.
 pub struct GridCallback {
     field: Arc<PhaseField>,
     colormap: Colormap,
@@ -939,8 +936,8 @@ impl GridCallback {
     /// Draws `field` with `colormap`.
     ///
     /// The renderer decides whether its uploaded copy is stale by comparing the
-    /// `Arc` itself, so passing a different field — including simply switching
-    /// which one the UI is showing — is all it takes to refresh the GPU.
+    /// `Arc` itself. Passing a different field, even by just switching which
+    /// one the UI shows, is all it takes to refresh the GPU.
     pub fn new(field: Arc<PhaseField>, colormap: Colormap, uniforms: GridUniforms) -> Self {
         Self {
             field,
@@ -1071,14 +1068,14 @@ mod tests {
             );
             assert!(
                 (colormap_position(PI, true, range) - 1.0).abs() < 1e-5,
-                "π sits at the end"
+                "pi sits at the end"
             );
-            // The interval is closed on the right, so -π wraps to +π and lands
+            // The interval is closed on the right, so -pi wraps to +pi and lands
             // at the far end. Harmless: the colormap is cyclic there, which is
             // exactly why wrapped mode uses a cyclic one.
             assert!(
                 (colormap_position(-PI, true, range) - 1.0).abs() < 1e-5,
-                "-π ≡ π, so it lands at the end rather than the start"
+                "-pi ≡ pi, so it lands at the end rather than the start"
             );
             assert!(
                 (colormap_position(TAU + 0.3, true, range) - colormap_position(0.3, true, range))
@@ -1202,7 +1199,7 @@ mod tests {
         }
     }
 
-    /// With no overlay at all, neither toggle may leak through — the wrapped
+    /// With no overlay at all, neither toggle may leak through: the wrapped
     /// tab has no integration path and no residues to draw.
     #[test]
     fn no_overlay_clears_every_toggle() {
@@ -1277,8 +1274,8 @@ mod tests {
     }
 
     /// The regression test for the tab-switch bug: the viewer's two tabs hold
-    /// two fields of identical size, so a staleness check based on size — or on
-    /// a counter identifying the scene rather than the field — reported "already
+    /// two fields of identical size. A staleness check based on size, or on a
+    /// counter identifying the scene rather than the field, reported "already
     /// uploaded" and left the previous tab's samples on screen.
     #[test]
     fn identical_fields_from_different_allocations_still_need_uploading() {

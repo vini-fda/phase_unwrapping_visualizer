@@ -16,7 +16,7 @@
 pub enum DisplayMode {
     /// Raw values, mapped over the field's own `[min, max]`.
     Unbounded,
-    /// Values wrapped to `(-π, π]`.
+    /// Values wrapped to `(-pi, pi]`.
     #[default]
     Wrapped,
 }
@@ -50,7 +50,7 @@ pub enum Colormap {
     /// Perceptually plain dark-to-light ramp, for unbounded values.
     Grayscale,
     /// Cyclic cubehelix palette, for wrapped phase: `sample(0) == sample(1)`,
-    /// so there is no seam at `±π`.
+    /// so there is no seam at `±pi`.
     CubehelixCycle,
 }
 
@@ -210,7 +210,7 @@ mod tests {
         }
     }
 
-    /// A cyclic map must close the loop, or wrapped phase shows a seam at ±π.
+    /// A cyclic map must close the loop, or wrapped phase shows a seam at ±pi.
     #[test]
     fn cyclic_colormap_closes_the_loop() {
         let map = Colormap::CubehelixCycle;

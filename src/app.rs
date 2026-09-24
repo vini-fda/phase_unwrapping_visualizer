@@ -22,7 +22,7 @@ enum Tab {
     /// nothing to compare against.
     #[default]
     Truth,
-    /// The observable phase, wrapped into `(-π, π]`.
+    /// The observable phase, wrapped into `(-pi, pi]`.
     Wrapped,
     /// A candidate unwrapping of it, with the integration path that produced it.
     Unwrapped,
@@ -44,8 +44,8 @@ impl Tab {
     fn tooltip(self) -> &'static str {
         match self {
             Self::Truth => "original phase before wrapping (not observable in practice).",
-            Self::Wrapped => "psi = wrap(truth), the observable phase in (-π, π]",
-            Self::Unwrapped => "A candidate unwrapping of ψ, and the path that produced it",
+            Self::Wrapped => "psi = wrap(truth), the observable phase in (-pi, pi]",
+            Self::Unwrapped => "A candidate unwrapping of psi, and the path that produced it",
         }
     }
 }
@@ -459,7 +459,7 @@ impl PhaseVisualizerApp {
             ui.colored_label(ui.visuals().warn_fg_color, "no path provided")
                 .on_hover_text(
                     "The residues and the disagreeing edges below are still exact, since they \
-                 need only ψ (wrapped phase) and φ (original phase). What is missing is which edges the integration path used, so \
+                 need only psi (wrapped phase) and phi (original phase). What is missing is which edges the integration path used, so \
                  the walls cannot separate cut edges from the path and the node view \
                  cannot draw arrows.",
                 );
@@ -683,10 +683,9 @@ impl PhaseVisualizerApp {
     /// - **An unwrapper.** It is swapped for `unwrapper`. A walk file loaded
     ///   beside it was never used, so dropping it loses nothing.
     fn use_unwrapper(&mut self, unwrapper: Unwrapper) {
-        // Keep the previous inputs in hand: an unwrapper can refuse the field
-        // it is given — SNAPHU will not touch a masked sample — and a refusal
-        // should say so rather than empty the view, exactly as a file that does
-        // not fit does.
+        // Keep the previous inputs: an unwrapper can refuse its field (SNAPHU
+        // will not touch a masked sample). A refusal should report an error and
+        // keep the view, as a file that does not fit does.
         let previous = self.inputs.clone();
 
         self.inputs.unwrapper = unwrapper;
@@ -981,7 +980,7 @@ mod tests {
             assert_eq!(
                 observed,
                 crate::phase::wrap(original),
-                "sample {index}: ψ must be wrap(truth)"
+                "sample {index}: psi must be wrap(truth)"
             );
         }
     }
@@ -996,7 +995,7 @@ mod tests {
         let (field, range) = app.displayed().expect("a scene is loaded");
         assert!(
             field.as_slice().iter().any(|value| value.abs() > PI),
-            "the original phase should leave (-π, π]"
+            "the original phase should leave (-pi, pi]"
         );
         assert!(
             range.1 - range.0 > 2.0 * PI,
@@ -1015,7 +1014,7 @@ mod tests {
     }
 
     /// The wrapped tab shows the observable, so every sample it displays is
-    /// already inside the interval — in grayscale as much as in cubehelix.
+    /// already inside the interval, in grayscale as much as in cubehelix.
     /// Showing the un-wrapped ground truth here made it look like the
     /// integrated field, which is the whole reason this is pinned.
     #[test]
@@ -1031,7 +1030,7 @@ mod tests {
                     .as_slice()
                     .iter()
                     .all(|value| -PI < *value && *value <= PI),
-                "{mode:?}: the wrapped tab must show ψ, not the phase behind it"
+                "{mode:?}: the wrapped tab must show psi, not the phase behind it"
             );
             assert!(
                 range.0 >= -PI - 1e-3 && range.1 <= PI + 1e-3,
@@ -1119,7 +1118,7 @@ mod tests {
         );
     }
 
-    /// The whole point of the wrapped slot: a supplied ψ is what the unwrapping
+    /// The whole point of the wrapped slot: a supplied psi is what the unwrapping
     /// was measured against, so it must never be silently replaced by one
     /// derived from the original.
     #[test]
@@ -1144,7 +1143,7 @@ mod tests {
         let shown = field_of(&app);
         assert!(
             shown.as_slice().iter().all(|value| *value == 0.25),
-            "the wrapped tab must show the ψ that was supplied, not wrap(original)"
+            "the wrapped tab must show the psi that was supplied, not wrap(original)"
         );
     }
 
@@ -1152,7 +1151,7 @@ mod tests {
     fn without_an_original_the_truth_tab_has_nothing_to_show() {
         let mut app = app();
         app.inputs.clear(Slot::Original);
-        // Something still has to provide ψ, or there is no scene at all.
+        // Something still has to provide psi, or there is no scene at all.
         app.inputs.wrapped = Some(Supplied {
             value: Arc::new(crate::demo::wrap_field(&crate::demo::noisy_ramp(
                 8, 8, 2.0, 1.0, 0.5, 3,
@@ -1174,7 +1173,7 @@ mod tests {
         );
         assert_eq!(
             app.inputs.state(Slot::Original),
-            crate::inputs::SlotState::Missing("not provided — the Truth tab is empty".to_owned()),
+            crate::inputs::SlotState::Missing("not provided: the Truth tab is empty".to_owned()),
             "and the sidebar must say so"
         );
     }
@@ -1226,15 +1225,15 @@ mod tests {
         assert_eq!(
             app.inputs.state(Slot::Path),
             crate::inputs::SlotState::Missing(
-                "not provided — no walls or arrows for the path".to_owned()
+                "not provided: no walls or arrows for the path".to_owned()
             ),
             "and the sidebar must say what that costs"
         );
     }
 
     /// The candidate slot offers a real unwrapper as well as the naive one.
-    /// Choosing it must rebuild the candidate — and leave no walk behind,
-    /// because SNAPHU solves for flows rather than walking a tree.
+    /// Choosing it must rebuild the candidate and leave no walk behind, because
+    /// SNAPHU solves for flows rather than walking a tree.
     #[test]
     fn choosing_snaphu_rebuilds_the_candidate_and_reports_no_path() {
         let mut app = app();
@@ -1265,7 +1264,7 @@ mod tests {
         assert_eq!(
             app.inputs.state(Slot::Path),
             crate::inputs::SlotState::Missing(
-                "not provided — no walls or arrows for the path".to_owned()
+                "not provided: no walls or arrows for the path".to_owned()
             ),
             "and say that this candidate came with no walk"
         );
@@ -1280,7 +1279,7 @@ mod tests {
         app.use_unwrapper(Unwrapper::Naive);
         assert!(
             Arc::ptr_eq(&naive, &field_of(&app)) || naive.as_slice() == field_of(&app).as_slice(),
-            "the comb integration of the same ψ is the same candidate"
+            "the comb integration of the same psi is the same candidate"
         );
         assert!(
             app.scene
@@ -1291,7 +1290,7 @@ mod tests {
     }
 
     /// An unwrapper that refuses the field must report the refusal and leave
-    /// what was on screen alone — the choice failed, so it did not happen.
+    /// what was on screen alone. The choice failed, so it did not happen.
     #[test]
     fn an_unwrapper_that_refuses_leaves_the_view_alone() {
         let mut app = app();
@@ -1377,8 +1376,7 @@ mod tests {
     }
 
     /// An unwrapper only runs when no file supplies a candidate, so choosing
-    /// one is also how a supplied candidate is given up — along with the walk
-    /// that described it.
+    /// one also gives up a supplied candidate and the walk that described it.
     #[test]
     fn choosing_an_unwrapper_gives_up_a_supplied_candidate() {
         let mut app = app();
@@ -1460,9 +1458,8 @@ mod tests {
     }
 
     /// Giving up a supplied original must generate one again rather than leave
-    /// none. Dropping it outright takes a derived wrapped phase with it, and
-    /// the viewer is left with nothing to show — which is what the button used
-    /// to do.
+    /// none. Dropping it outright, as the button used to, takes a derived
+    /// wrapped phase with it and leaves nothing to show.
     #[test]
     fn giving_up_the_original_falls_back_to_synthetic_not_to_nothing() {
         let mut app = app();
@@ -1503,7 +1500,7 @@ mod tests {
         app.use_synthetic(Slot::Wrapped);
         assert_eq!(
             app.inputs.state(Slot::Wrapped),
-            crate::inputs::SlotState::Derived("derived: ψ = wrap(original)".to_owned()),
+            crate::inputs::SlotState::Derived("derived: psi = wrap(original)".to_owned()),
             "the wrapped phase goes back to being derived"
         );
 
@@ -1546,11 +1543,10 @@ mod tests {
         );
     }
 
-    /// Every slot must describe itself, whatever state it is in — a blank line
-    /// in the sidebar would be worse than no sidebar.
-    /// Each row's revert button names what it falls back to, and "synthetic"
-    /// means something different in each — an algorithm for the candidate, a
-    /// derivation for the wrapped phase, a generated field for the original.
+    /// Each row's revert button names what it falls back to, because
+    /// "synthetic" means something different in each: an algorithm for the
+    /// candidate, a derivation for the wrapped phase, a generated field for
+    /// the original.
     #[test]
     fn the_candidate_falls_back_to_a_named_algorithm() {
         assert_eq!(

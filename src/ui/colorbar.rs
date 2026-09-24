@@ -33,7 +33,7 @@ impl Colorbar {
     /// Draws the ramp for `mode`, labelled with the values at its ends.
     ///
     /// `value_range` is `(min, max)` in the field's own units; it is ignored in
-    /// wrapped mode, where the range is always `(-π, π]`.
+    /// wrapped mode, where the range is always `(-pi, pi]`.
     pub fn show(&mut self, ui: &mut Ui, mode: DisplayMode, value_range: (f32, f32)) {
         let colormap = mode.colormap();
         let texture = self.texture(ui, colormap);
@@ -102,7 +102,7 @@ impl Colorbar {
 /// The tick marks for a mode, as `(fraction along the ramp, label)`.
 fn ticks(mode: DisplayMode, value_range: (f32, f32)) -> Vec<(f32, String)> {
     match mode {
-        DisplayMode::Wrapped => ["−π", "−π/2", "0", "π/2", "π"]
+        DisplayMode::Wrapped => ["−pi", "−pi/2", "0", "pi/2", "pi"]
             .into_iter()
             .enumerate()
             .map(|(i, label)| (i as f32 / 4.0, label.to_owned()))
@@ -142,9 +142,9 @@ mod tests {
     #[test]
     fn wrapped_ticks_span_the_whole_cycle() {
         let ticks = ticks(DisplayMode::Wrapped, (0.0, 1.0));
-        assert_eq!(ticks.len(), 5, "-π, -π/2, 0, π/2, π");
-        assert_eq!(ticks[0].0, 0.0, "-π sits at the bottom of the ramp");
-        assert_eq!(ticks[4].0, 1.0, "π sits at the top");
+        assert_eq!(ticks.len(), 5, "-pi, -pi/2, 0, pi/2, pi");
+        assert_eq!(ticks[0].0, 0.0, "-pi sits at the bottom of the ramp");
+        assert_eq!(ticks[4].0, 1.0, "pi sits at the top");
 
         // The labels are fixed strings; this pins them to the values the shader
         // actually maps to those positions.

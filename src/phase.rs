@@ -5,17 +5,17 @@
 
 use std::f32::consts::{PI, TAU};
 
-/// Wraps `x` to the half-open interval `(-π, π]`.
+/// Wraps `x` to the half-open interval `(-pi, pi]`.
 ///
 /// This is the `wrapping` operator from the interferometry literature: the
-/// observable phase of an interferogram is only ever known modulo `2π`, and
+/// observable phase of an interferogram is only ever known modulo `2pi`, and
 /// unwrapping is the problem of recovering the original `x` from `wrap(x)`.
 ///
 /// Non-finite inputs produce `NaN`, which callers treat as "masked".
 pub fn wrap(x: f32) -> f32 {
-    // `rem_euclid` lands in `[0, 2π)`, so `π - that` lands in `(-π, π]`.
-    // Wrapping `π - x` rather than `x` is what makes the interval closed on
-    // the right: `wrap(π) == π` and `wrap(-π) == π`.
+    // `rem_euclid` lands in `[0, 2pi)`, so `pi - that` lands in `(-pi, pi]`.
+    // Wrapping `pi - x` rather than `x` is what makes the interval closed on
+    // the right: `wrap(pi) == pi` and `wrap(-pi) == pi`.
     PI - (PI - x).rem_euclid(TAU)
 }
 
@@ -136,7 +136,7 @@ impl PhaseField {
             })
     }
 
-    /// A linear phase ramp, for demos: `φ(row, col) = 2π (cycles_x·u + cycles_y·v)`
+    /// A linear phase ramp, for demos: `phi(row, col) = 2pi (cycles_x·u + cycles_y·v)`
     /// where `u` and `v` are the normalized column and row coordinates of the
     /// sample's centre.
     ///
@@ -159,11 +159,11 @@ impl PhaseField {
 mod tests {
     use super::*;
 
-    /// `wrap` must land in `(-π, π]` — closed on the right, open on the left.
+    /// `wrap` must land in `(-pi, pi]`: open on the left, closed on the right.
     #[test]
     fn wrap_lands_in_the_half_open_interval() {
-        assert_eq!(wrap(PI), PI, "π is the included endpoint");
-        assert_eq!(wrap(-PI), PI, "-π ≡ π (mod 2π), and -π is excluded");
+        assert_eq!(wrap(PI), PI, "pi is the included endpoint");
+        assert_eq!(wrap(-PI), PI, "-pi ≡ pi (mod 2pi), and -pi is excluded");
         assert_eq!(wrap(0.0), 0.0, "zero is a fixed point");
 
         for i in -1000..1000 {
@@ -171,7 +171,7 @@ mod tests {
             let w = wrap(x);
             assert!(
                 -PI < w && w <= PI,
-                "wrap({x}) = {w} escaped the interval (-π, π]"
+                "wrap({x}) = {w} escaped the interval (-pi, pi]"
             );
         }
     }
@@ -185,7 +185,7 @@ mod tests {
                 let shifted = wrap(TAU.mul_add(k as f32, x));
                 assert!(
                     (shifted - wrap(x)).abs() < 1e-4,
-                    "wrap({x} + {k}·2π) = {shifted} != wrap({x}) = {}",
+                    "wrap({x} + {k}·2pi) = {shifted} != wrap({x}) = {}",
                     wrap(x)
                 );
             }

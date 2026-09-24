@@ -9,16 +9,16 @@
 //! `(m-1)(n-1)` edges are *cut*, and they are exactly the edges crossed by a
 //! spanning tree of the dual `G*`.
 //!
-//! `G*` has one vertex per inner corner — `(m-1) × (n-1)` of them — plus a
+//! `G*` has one vertex per inner corner, `(m-1) × (n-1)` in all, plus a
 //! single vertex `O` standing for the whole outer boundary. Each inner corner
 //! carries the residue of the four pixels around it.
 //!
 //! # What gets highlighted
 //!
 //! For every edge, integration *should* move the phase by the wrapped
-//! difference `wrap(ψ_b - ψ_a)`. Along the tree that holds by construction, but
+//! difference `wrap(psi_b - psi_a)`. Along the tree that holds by construction, but
 //! a candidate unwrapping is only a candidate: this module measures
-//! `(Δφ - Δψ) / 2π` on *every* edge rather than assuming it, and a non-zero
+//! `(delta phi - delta psi) / 2pi` on *every* edge rather than assuming it, and a non-zero
 //! result is what the viewer draws in the highlight colour.
 
 use std::f32::consts::TAU;
@@ -92,9 +92,9 @@ pub enum Traversal {
 
 /// Texel code meaning "this wall has no role in an integration path".
 ///
-/// Covers both the slots where no edge exists — the right edge of the last
-/// column, the bottom edge of the last row — and every edge when no path was
-/// supplied at all. The shader draws both the same way: a plain wall, neither
+/// Covers the slots where no edge exists (the right edge of the last column
+/// and the bottom edge of the last row), and every edge when no path was
+/// supplied. The shader draws both the same way: a plain wall, neither
 /// dashed as part of a walk nor eligible for the cut-edge colour.
 pub const EDGE_NO_ROLE: u8 = 3;
 
@@ -121,7 +121,7 @@ pub struct EdgeState {
     /// supplied and there is nothing to say about it.
     pub traversal: Option<Traversal>,
 
-    /// `(Δφ - Δψ) / 2π`, rounded.
+    /// `(delta phi - delta psi) / 2pi`, rounded.
     ///
     /// Zero means the integration moved the phase by exactly the wrapped
     /// difference. Anything else is an edge where the unwrapping disagrees with
@@ -141,7 +141,7 @@ impl EdgeState {
 ///
 /// One byte per pixel encodes the whole integration path: which edges it used,
 /// which way it crossed each of them, and where it started. That is a great
-/// deal less than an explicit edge list — `mn` bytes against roughly `9mn` —
+/// deal less than an explicit edge list (`mn` bytes against roughly `9mn`),
 /// and it is the form a breadth-first, depth-first or region-growing unwrapper
 /// already has in hand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -574,8 +574,8 @@ impl Unwrapping {
     /// `wrapped` alone and the disagreeing edges from the two fields together,
     /// so everything the highlight shows survives without it. What is lost is
     /// the cut/tree distinction between walls, the arrows in the node view, and
-    /// the edge counts — all of which are statements about a path, and cannot
-    /// be invented when none was given.
+    /// the edge counts. These all describe a path, and cannot be invented when
+    /// none was given.
     ///
     /// # Errors
     ///
@@ -751,7 +751,7 @@ impl Unwrapping {
     }
 }
 
-/// `(Δφ - Δψ) / 2π` on the edge from `a` to `b`, rounded.
+/// `(delta phi - delta psi) / 2pi` on the edge from `a` to `b`, rounded.
 ///
 /// Non-finite samples yield `0`: nothing can be said about a masked edge, and
 /// reporting it as inconsistent would drown the real signal.
@@ -791,9 +791,9 @@ fn residue_field(wrapped: &PhaseField) -> Vec<i8> {
 
 /// The residue of the loop around the inner corner below-right of `(row, col)`.
 ///
-/// Sums the wrapped differences clockwise on screen — right, down, left, up —
-/// and divides by `2π`. Each term lies in `(-π, π]`, so the sum is strictly
-/// inside `(-4π, 4π)` for real data and the charge is always `-1`, `0` or `+1`.
+/// Sums the wrapped differences clockwise on screen (right, down, left, up)
+/// and divides by `2pi`. Each term lies in `(-pi, pi]`, so the sum is strictly
+/// inside `(-4pi, 4pi)` for real data and the charge is always `-1`, `0` or `+1`.
 ///
 /// A loop touching a non-finite sample has no meaningful residue and reports
 /// `0`.
@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn a_residue_free_field_unwraps_with_no_inconsistent_edges() {
         let (rows, cols) = (11, 13);
-        // A gentle ramp: consecutive samples are far less than π apart, so no
+        // A gentle ramp: consecutive samples are far less than pi apart, so no
         // loop can accumulate a full turn and there are no residues.
         let truth = PhaseField::linear_gradient(rows, cols, 1.0, 0.5);
         let psi = wrapped_of(&truth);
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn a_single_residue_forces_at_least_one_inconsistent_edge() {
         // A 2 × 2 loop carrying one full turn: the four wrapped differences
-        // around it sum to 2π, so the corner has charge +1.
+        // around it sum to 2pi, so the corner has charge +1.
         let quarter = PI / 2.0 + 0.2;
         let psi = PhaseField::new(
             vec![
@@ -1009,11 +1009,11 @@ mod tests {
 
     /// Summing every face's residue makes each interior edge appear twice, once
     /// in each direction, so they all cancel and only the outer boundary
-    /// survives. The total charge is therefore the boundary circulation — the
-    /// charge that the dual vertex `O` carries — and *not* zero in general.
+    /// survives. The total charge is therefore the boundary circulation, which
+    /// is the charge on the dual vertex `O` and *not* zero in general.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the circulation of a finite field is a small multiple of 2π"
+        reason = "the circulation of a finite field is a small multiple of 2pi"
     )]
     #[test]
     fn total_residue_equals_the_boundary_circulation() {
@@ -1149,8 +1149,8 @@ mod tests {
         );
     }
 
-    /// Without a path the residues and the disagreeing edges are unchanged —
-    /// they never needed one — but nothing can be said about any edge's role.
+    /// Residues and disagreeing edges never needed a path, so they are
+    /// unchanged without one. Only the edges' roles become unknown.
     #[test]
     fn an_unwrapping_without_a_path_still_measures_everything_it_can() {
         let (rows, cols) = (12, 10);
@@ -1167,7 +1167,7 @@ mod tests {
         assert_eq!(
             with.stats().inconsistent_edges,
             without.stats().inconsistent_edges,
-            "the disagreeing edges come from ψ and φ alone"
+            "the disagreeing edges come from psi and phi alone"
         );
         assert_eq!(
             (
@@ -1178,7 +1178,7 @@ mod tests {
                 without.stats().positive_residues,
                 without.stats().negative_residues
             ),
-            "and the residues from ψ alone"
+            "and the residues from psi alone"
         );
 
         assert_eq!(

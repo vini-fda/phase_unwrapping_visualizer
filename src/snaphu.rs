@@ -2,18 +2,18 @@
 //!
 //! [`snaphu_rs`] is a port of SNAPHU, the statistical-cost network-flow
 //! unwrapper: instead of walking a spanning tree and integrating as it goes, it
-//! solves for the flows on the pixel graph that cost least, and integrates ψ
-//! along them. That is the difference the viewer exists to show — the naive
-//! comb integration it makes for itself smears every residue across a whole
-//! row, and this does not.
+//! solves for the flows on the pixel graph that cost least, and integrates psi
+//! along them. That is the difference the viewer exists to show: the naive
+//! comb integration smears every residue across a whole row, and this does
+//! not.
 //!
 //! The viewer drives it at one fixed setting of the parameters, chosen here
 //! rather than exposed: the point of the option is to have a real unwrapper to
 //! compare against, not to become a front end for SNAPHU's configuration.
 //!
-//! Nothing comes back but the phase. SNAPHU has no integration path to report —
-//! its answer is a flow field, not a walk — so a candidate from here has none,
-//! exactly as a candidate opened from a file without its `.path` does.
+//! Only the phase comes back. SNAPHU's answer is a flow field, not a walk, so
+//! it has no integration path to report. A candidate from here has none, just
+//! like a candidate opened from a file without its `.path`.
 
 use snaphu_rs::data::raster::Raster;
 use snaphu_rs::{CostMode, RunConfig, SnaphuError, UnwrapInputs, run_snaphu_inplace};
@@ -24,8 +24,8 @@ use crate::phase::PhaseField;
 ///
 /// Stock defaults but for the cost mode. SNAPHU's own default is topography
 /// mode, which reads the phase as terrain and prices every arc through a
-/// baseline, a wavelength and an orbit geometry — none of which a phase field
-/// on its own has. Smooth mode asks for none of that: it prices an arc by how
+/// baseline, a wavelength and an orbit geometry. A bare phase field has none
+/// of these. Smooth mode asks for none of that: it prices an arc by how
 /// far the flow bends the solution, which is all that can be said about phase
 /// that arrived without its radar.
 fn config() -> RunConfig {
@@ -39,17 +39,17 @@ fn config() -> RunConfig {
 ///
 /// # Errors
 ///
-/// Returns [`SnaphuError`] if the field is smaller than 2 × 2, if it holds a
-/// non-finite sample — the viewer's "masked" pixels, which SNAPHU has no
-/// meaning for — or if the solver itself fails.
+/// Returns [`SnaphuError`] if the field is smaller than 2 × 2, if the solver
+/// fails, or if the field holds a non-finite sample. Those are the viewer's
+/// masked pixels, which SNAPHU cannot handle.
 pub fn unwrap(wrapped: &PhaseField) -> Result<PhaseField, SnaphuError> {
     let (rows, cols) = (wrapped.rows(), wrapped.cols());
 
-    // A `Raster` owns its samples, so ψ is copied on the way in. The way out is
+    // A `Raster` owns its samples, so psi is copied on the way in. The way out is
     // not: `run_snaphu_inplace` writes straight into the buffer that becomes
     // the returned field, rather than allocating a raster we would then move
-    // out of. The other three outputs — flows, connected components, the
-    // magnitude actually used — are not asked for, so they are not produced.
+    // out of. The other three outputs (flows, connected components and the
+    // magnitude used) are not requested, so they are not produced.
     let psi = Raster::new(cols, rows, wrapped.as_slice().to_vec());
     let mut unwrapped = vec![0.0f32; rows * cols];
     run_snaphu_inplace(
@@ -72,8 +72,8 @@ mod tests {
     use std::f32::consts::TAU;
 
     /// A ramp with no noise has no residues, so every unwrapper must recover it
-    /// exactly — up to the constant offset that unwrapping can never pin down,
-    /// and which is a whole number of turns because φ stays congruent to ψ.
+    /// exactly, up to a constant offset. Unwrapping can never pin that offset
+    /// down, and it is a whole number of turns because phi stays congruent to psi.
     #[test]
     fn a_noiseless_ramp_comes_back_whole() {
         let truth = demo::noisy_ramp(24, 32, 2.0, 1.0, 0.0, 7);
@@ -104,7 +104,7 @@ mod tests {
         }
     }
 
-    /// Whatever the solution, it has to be a candidate at all: φ ≡ ψ (mod 2π).
+    /// Whatever the solution, it has to be a candidate at all: phi ≡ psi (mod 2pi).
     #[test]
     fn the_candidate_stays_congruent_to_the_wrapped_phase() {
         let wrapped = demo::wrap_field(&demo::noisy_ramp(16, 16, 3.0, 1.0, 0.8, 11));
@@ -120,7 +120,7 @@ mod tests {
             let turns = (phi - psi) / TAU;
             assert!(
                 (turns - turns.round()).abs() < 1e-3,
-                "sample {index}: φ − ψ = {} is not a whole number of turns",
+                "sample {index}: phi − psi = {} is not a whole number of turns",
                 phi - psi
             );
         }

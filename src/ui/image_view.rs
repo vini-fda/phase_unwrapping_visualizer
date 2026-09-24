@@ -29,7 +29,7 @@ pub struct HoverInfo {
     pub col: usize,
     /// The stored sample.
     pub value: f32,
-    /// The sample wrapped to `(-π, π]`.
+    /// The sample wrapped to `(-pi, pi]`.
     pub wrapped: f32,
 }
 

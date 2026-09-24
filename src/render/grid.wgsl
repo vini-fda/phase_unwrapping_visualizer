@@ -98,7 +98,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOutput {
     return out;
 }
 
-// Wraps `x` to (-π, π]. Mirrors `phase::wrap` on the Rust side.
+// Wraps `x` to (-pi, pi]. Mirrors `phase::wrap` on the Rust side.
 fn wrap_to_pi(x: f32) -> f32 {
     let y = PI - x;
     return PI - (y - TAU * floor(y / TAU));
