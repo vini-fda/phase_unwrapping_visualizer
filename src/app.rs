@@ -675,11 +675,13 @@ impl PhaseVisualizerApp {
     }
 
     /// Makes the candidate with `unwrapper`, in place of whatever was filling
-    /// the slot.
+    /// the slot. That was one of:
     ///
-    /// An unwrapper is only used when no file supplies a candidate, so
-    /// choosing one gives up any file that does — and the walk that came with
-    /// it, which described that file's candidate and not this one.
+    /// - **A file.** An unwrapper is only used when no file supplies a
+    ///   candidate, so the file is given up. Any walk that came with it goes
+    ///   too, since it described the file's candidate, not this one.
+    /// - **An unwrapper.** It is swapped for `unwrapper`. A walk file loaded
+    ///   beside it was never used, so dropping it loses nothing.
     fn use_unwrapper(&mut self, unwrapper: Unwrapper) {
         // Keep the previous inputs in hand: an unwrapper can refuse the field
         // it is given — SNAPHU will not touch a masked sample — and a refusal
