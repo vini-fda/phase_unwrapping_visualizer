@@ -1,11 +1,7 @@
 //! The snaphu-rs unwrapper, wired to the viewer's phase fields.
 //!
 //! [`snaphu_rs`] is a port of SNAPHU, the statistical-cost network-flow
-//! unwrapper: instead of walking a spanning tree and integrating as it goes, it
-//! solves for the flows on the pixel graph that cost least, and integrates psi
-//! along them. That is the difference the viewer exists to show: the naive
-//! comb integration smears every residue across a whole row, and this does
-//! not.
+//! phase unwrapping software from Stanford: https://web.stanford.edu/group/radar/softwareandlinks/sw/snaphu/.
 //!
 //! The viewer drives it at one fixed setting of the parameters, chosen here
 //! rather than exposed: the point of the option is to have a real unwrapper to
