@@ -20,7 +20,7 @@ log = "0.4.27"
 serde = { version = "1.0.219", features = ["derive"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 
-snaphu-rs = { package = "snaphu-rs", git = "git@github.com:vini-fda/snaphu-rs.git", branch = "main" }
+snaphu-rs = { package = "snaphu-rs", git = "https://github.com/vini-fda/snaphu-rs.git", branch = "main" }
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

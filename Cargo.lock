@@ -3181,6 +3181,7 @@ dependencies = [
 [[package]]
 name = "snaphu-rs"
 version = "0.1.0"
+source = "git+https://github.com/vini-fda/snaphu-rs.git?branch=main#e80f6facc254f2285ed132610a77f7254e573f0d"
 dependencies = [
  "clap",
  "cost-scaling-rs",

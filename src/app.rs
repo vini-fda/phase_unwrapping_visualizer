@@ -305,7 +305,7 @@ impl PhaseVisualizerApp {
             }
         }
         #[cfg(target_arch = "wasm32")]
-        let _ = ctx;
+        let _: &egui::Context = ctx;
 
         if let Some(opened) = self.dialog.take() {
             self.accept(opened);
