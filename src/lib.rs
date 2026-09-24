@@ -1,7 +1,5 @@
 //! An interactive viewer for `InSAR` phase fields.
 
-#![warn(clippy::all, rust_2018_idioms)]
-
 mod app;
 mod render;
 mod ui;
