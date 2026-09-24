@@ -1,0 +1,486 @@
+//! What the viewer has been given, and what it derives from it.
+//!
+//! Four things go in, and only one of them is strictly required:
+//!
+//! | Input | What it is | If absent |
+//! |---|---|---|
+//! | **Original phase** | the phase before wrapping | the Truth tab has nothing to show |
+//! | **Wrapped phase** `psi` | the observable | derived as `wrap(original)` |
+//! | **Unwrapped phase** `phi` | a candidate | made here by whichever [`Unwrapper`] is chosen |
+//! | **Integration path** | the walk that produced `phi` | walls and arrows cannot say what the walk did |
+//!
+//! Everything is measured against `psi`, so it cannot be missing. At least one of
+//! the original or the wrapped phase has to be there.
+//!
+//! A supplied `psi` is never overwritten by one derived from the original. An
+//! unwrapper consumed some particular `psi`. If the viewer measured against a
+//! different one (another mask, another wrapping convention, a filtering step in
+//! between), every reported disagreement would come from the mismatch rather
+//! than from the unwrapping.
+
+use std::sync::Arc;
+
+use crate::demo::{self, SceneSettings};
+use crate::graph::{IntegrationPath, Unwrapping, UnwrappingError};
+use crate::phase::PhaseField;
+
+/// Where one input came from, for the UI to report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Made up by the demo generator.
+    Generated,
+    /// Read from a file of this name.
+    File(String),
+}
+
+impl Origin {
+    /// How to name it in the sidebar.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Generated => "synthetic".to_owned(),
+            Self::File(name) => name.clone(),
+        }
+    }
+}
+
+/// One supplied input and where it came from.
+#[derive(Clone, Debug)]
+pub struct Supplied<T> {
+    /// The data itself.
+    pub value: T,
+    /// Where it was obtained.
+    pub origin: Origin,
+}
+
+/// Which algorithm fills the candidate slot when no file is supplied.
+///
+/// Both are unwrappers of psi and nothing else, so either can be asked for at any
+/// time; they differ in what they are worth looking at for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Unwrapper {
+    /// Integrate psi along a comb path: down the first column, then across each
+    /// row. Deliberately poor, and the default for that reason.
+    #[default]
+    Naive,
+    /// The snaphu-rs port of SNAPHU, at the fixed settings in
+    /// [`crate::snaphu`].
+    Snaphu,
+}
+
+impl Unwrapper {
+    /// Every unwrapper, worst first.
+    pub const ALL: [Self; 2] = [Self::Naive, Self::Snaphu];
+
+    /// What the entry in the slot's combo box says.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Naive => "Use naive unwrapping algorithm",
+            Self::Snaphu => "Use snaphu-rs",
+        }
+    }
+
+    /// What choosing it does, and what it costs.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Naive => {
+                "Integrate psi here along a comb path: down the first column, then across \
+                 each row.\n\n\
+                 The naive raster method, and a poor unwrapper deliberately: a single residue \
+                 it walks past smears a whole row. Its path is known exactly, because the \
+                 viewer chose it, so the walls and the arrows have something to show."
+            }
+            Self::Snaphu => {
+                "Unwrap psi here with snaphu-rs, the Rust port of SNAPHU. It does \
+                 statistical-cost network-flow unwrapping, here in smooth-cost mode at stock \
+                 parameters.\n\n\
+                 A real unwrapper, and the thing worth comparing the naive one against. It \
+                 solves for flows rather than walking a tree, so it reports no integration \
+                 path: the residues and the disagreeing edges are still exact, but the walls \
+                 cannot separate cut from tree and the node view draws no arrows.\n\n\
+                 Runs on the spot, so a large field takes a moment."
+            }
+        }
+    }
+
+    /// How the sidebar describes a candidate this one produced.
+    pub fn derivation(self) -> &'static str {
+        match self {
+            Self::Naive => "integrated here along a comb path",
+            Self::Snaphu => "unwrapped here by snaphu-rs",
+        }
+    }
+}
+
+/// Which of the four inputs a file is being opened for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// The phase before wrapping.
+    Original,
+    /// The observable wrapped phase.
+    Wrapped,
+    /// A candidate unwrapping.
+    Unwrapped,
+    /// The walk that produced the candidate.
+    Path,
+}
+
+impl Slot {
+    /// Every slot, in the order the pipeline uses them.
+    pub const ALL: [Self; 4] = [Self::Original, Self::Wrapped, Self::Unwrapped, Self::Path];
+
+    /// Short name for the sidebar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Original => "Original phase",
+            Self::Wrapped => "Wrapped phase",
+            Self::Unwrapped => "Unwrapped phase",
+            Self::Path => "Integration path",
+        }
+    }
+
+    /// What this input is for, and what happens without it.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Original => {
+                "The phase before wrapping, which an unwrapping tries to recover.\n\n\
+                 Optional. Only the Truth tab shows it, and a real interferogram does not come \
+                 with one. If given and no wrapped phase is, the wrapped phase is derived from \
+                 it as psi = wrap(original)."
+            }
+            Self::Wrapped => {
+                "The observable phase psi, inside (-pi, pi]. Everything else is measured against it.\n\n\
+                 Required, but it can come from the original instead: supply one or the other. \
+                 If your unwrapping was produced elsewhere, supply the very same psi it consumed, \
+                 or the disagreeing edges describe the mismatch rather than the unwrapping."
+            }
+            Self::Unwrapped => {
+                "A candidate unwrapping phi, congruent to psi modulo 2pi.\n\n\
+                 Optional. Without one the viewer makes its own by integrating psi down the first \
+                 column, then across each row. That is the naive raster method, a deliberately \
+                 poor unwrapper."
+            }
+            Self::Path => {
+                "The walk that produced the unwrapped phase, as one byte per pixel naming the \
+                 neighbour each was reached from.\n\n\
+                 Optional, and only meaningful alongside a supplied unwrapped phase. Without it \
+                 the residues and the disagreeing edges are still exact, since they need only psi \
+                 and phi. But the walls cannot separate cut edges from the path, and the node view \
+                 cannot draw arrows."
+            }
+        }
+    }
+
+    /// What the entry that gives up this slot's file should say.
+    ///
+    /// Each names the thing it falls back *to*, because "synthetic" means
+    /// something different in each row: a generated field for the original, a
+    /// derivation for the wrapped phase, an algorithm for the candidate. The
+    /// candidate has several algorithms, listed in [`Unwrapper::ALL`], so this
+    /// names only the default one.
+    pub fn fallback_label(self) -> &'static str {
+        match self {
+            Self::Original | Self::Wrapped | Self::Path => "Use synthetic",
+            Self::Unwrapped => Unwrapper::Naive.label(),
+        }
+    }
+
+    /// What happens to this slot when its file is given up.
+    pub fn fallback_tooltip(self) -> &'static str {
+        match self {
+            Self::Original => {
+                "Stop using this file and generate a synthetic original phase again.\n\n\
+                 Not simply dropped: with no original at all, a derived wrapped phase would \
+                 go with it and leave nothing to show."
+            }
+            Self::Wrapped => {
+                "Stop using this file. The wrapped phase goes back to being derived from the \
+                 original as psi = wrap(original)."
+            }
+            Self::Unwrapped => {
+                "Stop using this file. The viewer goes back to unwrapping psi itself, with \
+                 whichever of its own unwrappers is chosen."
+            }
+            Self::Path => {
+                "Stop using this file. With a supplied unwrapped phase and no path, the walls \
+                 and arrows cannot say what the walk did."
+            }
+        }
+    }
+
+    /// The file extension this slot reads.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Original | Self::Wrapped | Self::Unwrapped => crate::phase_file::EXTENSION,
+            Self::Path => crate::phase_file::PATH_EXTENSION,
+        }
+    }
+}
+
+/// Everything the viewer has been given.
+#[derive(Clone, Debug, Default)]
+pub struct Inputs {
+    /// The phase before wrapping.
+    pub original: Option<Supplied<Arc<PhaseField>>>,
+    /// The observable phase, when supplied rather than derived.
+    pub wrapped: Option<Supplied<Arc<PhaseField>>>,
+    /// A candidate unwrapping, when supplied rather than made here.
+    pub unwrapped: Option<Supplied<Arc<PhaseField>>>,
+    /// The walk behind that candidate.
+    pub path: Option<Supplied<Arc<IntegrationPath>>>,
+    /// Which unwrapper makes the candidate when no file supplies one. Idle
+    /// while a file does.
+    pub unwrapper: Unwrapper,
+}
+
+/// How a slot is currently being filled: supplied, derived, or not at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// Supplied directly, from here.
+    Supplied(Origin),
+    /// Not supplied, but worked out from what was. The string says how.
+    Derived(String),
+    /// Not supplied and not derivable. The string says what that costs.
+    Missing(String),
+}
+
+impl SlotState {
+    /// `true` when a file was supplied for this slot, so it can be cleared.
+    pub fn is_supplied(&self) -> bool {
+        matches!(self, Self::Supplied(_))
+    }
+
+    /// One line for the sidebar.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Supplied(origin) => origin.label(),
+            Self::Derived(how) | Self::Missing(how) => how.clone(),
+        }
+    }
+}
+
+/// A scene resolved from the inputs, ready to display.
+pub struct Resolved {
+    /// The phase before wrapping, if there is one.
+    pub original: Option<Arc<PhaseField>>,
+    /// The observable phase.
+    pub wrapped: Arc<PhaseField>,
+    /// The candidate and its analysis.
+    pub unwrapping: Arc<Unwrapping>,
+    /// The candidate's samples, shared with the render callback.
+    pub unwrapped: Arc<PhaseField>,
+}
+
+/// Why the inputs could not be turned into a scene.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveError {
+    /// Neither an original nor a wrapped phase was supplied.
+    NoWrappedPhase,
+    /// Two inputs describe different shapes.
+    ShapeMismatch {
+        /// Which input disagreed.
+        slot: Slot,
+        /// The shape everything else has, as `(rows, cols)`.
+        expected: (usize, usize),
+        /// The shape this one has, as `(rows, cols)`.
+        found: (usize, usize),
+    },
+    /// The analysis rejected the combination.
+    Unwrapping(UnwrappingError),
+    /// snaphu-rs refused to unwrap the wrapped phase.
+    Snaphu(snaphu_rs::SnaphuError),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoWrappedPhase => write!(
+                f,
+                "no wrapped phase: open either an original phase to wrap, or a wrapped phase directly"
+            ),
+            Self::ShapeMismatch {
+                slot,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{} is {} × {}, but the rest of the data is {} × {}",
+                slot.label(),
+                found.0,
+                found.1,
+                expected.0,
+                expected.1
+            ),
+            Self::Unwrapping(error) => write!(f, "{error}"),
+            Self::Snaphu(error) => write!(f, "snaphu-rs could not unwrap this field: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+impl Inputs {
+    /// The inputs the demo starts from: a generated original, everything else
+    /// derived.
+    pub fn generated(settings: SceneSettings) -> Self {
+        Self {
+            original: Some(Supplied {
+                value: Arc::new(demo::noisy_ramp(
+                    settings.rows,
+                    settings.cols,
+                    settings.cycles_x,
+                    settings.cycles_y,
+                    settings.noise,
+                    settings.seed,
+                )),
+                origin: Origin::Generated,
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// How each slot is currently being filled, for the sidebar to report.
+    pub fn state(&self, slot: Slot) -> SlotState {
+        let supplied = match slot {
+            Slot::Original => self.original.as_ref().map(|input| &input.origin),
+            Slot::Wrapped => self.wrapped.as_ref().map(|input| &input.origin),
+            Slot::Unwrapped => self.unwrapped.as_ref().map(|input| &input.origin),
+            Slot::Path => self.path.as_ref().map(|input| &input.origin),
+        };
+        if let Some(origin) = supplied {
+            return SlotState::Supplied(origin.clone());
+        }
+
+        match slot {
+            Slot::Original => SlotState::Missing("not provided: the Truth tab is empty".to_owned()),
+            Slot::Wrapped => {
+                if self.original.is_some() {
+                    SlotState::Derived("derived: psi = wrap(original)".to_owned())
+                } else {
+                    SlotState::Missing("not provided: nothing to show".to_owned())
+                }
+            }
+            Slot::Unwrapped => SlotState::Derived(self.unwrapper.derivation().to_owned()),
+            Slot::Path => {
+                // Only the comb walk is a walk the viewer knows: a supplied
+                // candidate was produced elsewhere, and SNAPHU solves for flows
+                // rather than walking at all.
+                if self.unwrapped.is_none() && self.unwrapper == Unwrapper::Naive {
+                    SlotState::Derived("comb path from (0, 0)".to_owned())
+                } else {
+                    SlotState::Missing("not provided: no walls or arrows for the path".to_owned())
+                }
+            }
+        }
+    }
+
+    /// Forgets whatever was supplied for `slot`.
+    pub fn clear(&mut self, slot: Slot) {
+        match slot {
+            Slot::Original => self.original = None,
+            Slot::Wrapped => self.wrapped = None,
+            Slot::Unwrapped => {
+                self.unwrapped = None;
+                // A path describes a walk that produced a particular candidate.
+                // Without the candidate it describes nothing.
+                self.path = None;
+            }
+            Slot::Path => self.path = None,
+        }
+    }
+
+    /// The shape everything must agree on, taken from the first input there is.
+    fn shape(&self) -> Option<(usize, usize)> {
+        let field = self
+            .wrapped
+            .as_ref()
+            .or(self.original.as_ref())
+            .or(self.unwrapped.as_ref())?;
+        Some((field.value.rows(), field.value.cols()))
+    }
+
+    /// Turns the inputs into something displayable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolveError`] if there is no wrapped phase to be had, if the
+    /// inputs disagree about the shape of the field, or if the analysis rejects
+    /// the combination.
+    pub fn resolve(&self) -> Result<Resolved, ResolveError> {
+        let Some(expected) = self.shape() else {
+            return Err(ResolveError::NoWrappedPhase);
+        };
+
+        for (slot, shape) in [
+            (
+                Slot::Original,
+                self.original
+                    .as_ref()
+                    .map(|i| (i.value.rows(), i.value.cols())),
+            ),
+            (
+                Slot::Wrapped,
+                self.wrapped
+                    .as_ref()
+                    .map(|i| (i.value.rows(), i.value.cols())),
+            ),
+            (
+                Slot::Unwrapped,
+                self.unwrapped
+                    .as_ref()
+                    .map(|i| (i.value.rows(), i.value.cols())),
+            ),
+            (
+                Slot::Path,
+                self.path.as_ref().map(|i| (i.value.rows(), i.value.cols())),
+            ),
+        ] {
+            if let Some(found) = shape
+                && found != expected
+            {
+                return Err(ResolveError::ShapeMismatch {
+                    slot,
+                    expected,
+                    found,
+                });
+            }
+        }
+
+        // A supplied psi wins over one derived from the original: it is what the
+        // unwrapping was actually measured against.
+        let wrapped = match (self.wrapped.as_ref(), self.original.as_ref()) {
+            (Some(supplied), _) => Arc::clone(&supplied.value),
+            (None, Some(original)) => Arc::new(demo::wrap_field(&original.value)),
+            (None, None) => return Err(ResolveError::NoWrappedPhase),
+        };
+
+        let (candidate, path) = match (self.unwrapped.as_ref(), self.unwrapper) {
+            (Some(supplied), _) => (
+                supplied.value.as_ref().clone(),
+                self.path.as_ref().map(|path| path.value.as_ref().clone()),
+            ),
+            // No candidate given, so make one. The comb walk is known exactly,
+            // because we chose it; SNAPHU's answer is a flow field and comes
+            // with no walk at all.
+            (None, Unwrapper::Naive) => {
+                let comb = IntegrationPath::comb(expected.0, expected.1);
+                let integrated =
+                    demo::integrate(&wrapped, &comb).map_err(ResolveError::Unwrapping)?;
+                (integrated, Some(comb))
+            }
+            (None, Unwrapper::Snaphu) => (
+                crate::snaphu::unwrap(&wrapped).map_err(ResolveError::Snaphu)?,
+                None,
+            ),
+        };
+
+        let unwrapping =
+            Unwrapping::new(&wrapped, candidate, path).map_err(ResolveError::Unwrapping)?;
+
+        Ok(Resolved {
+            original: self.original.as_ref().map(|input| Arc::clone(&input.value)),
+            unwrapped: Arc::new(unwrapping.unwrapped().clone()),
+            unwrapping: Arc::new(unwrapping),
+            wrapped,
+        })
+    }
+}
